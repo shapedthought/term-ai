@@ -496,32 +496,46 @@ The `web_search` tool is defined in `build_tool_definitions()`:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> InitMessages: build_initial_messages()
-    InitMessages --> CallOllama: POST /api/chat
+    [*] --> InitMessages
+    InitMessages --> CallOllama
 
-    CallOllama --> CheckResponse: Receive response
+    CallOllama --> CheckResponse
 
-    CheckResponse --> HasToolCalls: tool_calls present?
+    CheckResponse --> HasToolCalls
 
     HasToolCalls --> ExecuteTools: Yes
     HasToolCalls --> FormatOutput: No
 
-    ExecuteTools --> TrackQuery: Verbose: Track query
-    TrackQuery --> CallProvider: provider.search()
-    CallProvider --> ParseResults: Verbose: Parse results
-    ParseResults --> AppendMessage: Add tool result to messages
-    AppendMessage --> CheckIterations: iteration < 10?
+    ExecuteTools --> TrackQuery
+    TrackQuery --> CallProvider
+    CallProvider --> ParseResults
+    ParseResults --> AppendMessage
+    AppendMessage --> CheckIterations
 
     CheckIterations --> CallOllama: Yes (continue loop)
     CheckIterations --> ErrorMaxIterations: No
 
-    FormatOutput --> CheckVerbose: Verbose enabled?
+    FormatOutput --> CheckVerbose
     CheckVerbose --> FormatVerbose: Yes
     CheckVerbose --> ReturnPlain: No
 
-    FormatVerbose --> [*]: Formatted output
-    ReturnPlain --> [*]: Plain command
-    ErrorMaxIterations --> [*]: Error
+    FormatVerbose --> [*]
+    ReturnPlain --> [*]
+    ErrorMaxIterations --> [*]
+
+    note right of InitMessages: build_initial_messages()
+    note right of CallOllama: POST /api/chat
+    note right of CheckResponse: Receive response
+    note right of HasToolCalls: tool_calls present?
+    note right of TrackQuery: Verbose: Track query
+    note right of CallProvider: provider.search()
+    note right of ParseResults: Verbose: Parse results
+    note right of AppendMessage: Add tool result to messages
+    note right of CheckIterations: iteration < 10?
+    note right of CheckVerbose: Verbose enabled?
+    note right of FormatVerbose: Formatted output
+    note right of ReturnPlain: Plain command
+    note right of ErrorMaxIterations: Error
 ```
 
 ### Tool Execution Flow
@@ -721,7 +735,7 @@ graph TD
 | **Model** | `--model` | `TERM_AI_MODEL` | `llama3.2` | None |
 | **Endpoint** | `--endpoint` | - | `http://localhost:11434` | None |
 | **Websearch** | `-w`, `--ws`, `--websearch` | - | `false` | Boolean |
-| **Search Provider** | `--search-provider` | Auto-detect via `BRAVE_API_KEY` | `duckduckgo` | Enum: duckduckgo, brave |
+| **Search Provider** | `--search-provider` | Auto-detect: Brave > SerpAPI | Auto-detect (Error if no keys) | Enum: brave, serpapi |
 | **Brave API Key** | `--brave-api-key` | `BRAVE_API_KEY` | `None` | Required for Brave |
 | **Max Results** | `--max-results` | - | `5` | Positive integer |
 | **Verbose** | `-v`, `--verbose` | - | `false` | Boolean |
@@ -751,10 +765,11 @@ term-ai "latest rust version" -w
 ```bash
 export TERM_AI_MODEL=gemma3
 export BRAVE_API_KEY=xxx
+export SERPAPI_KEY=yyy
 
-term-ai "query" -w --model llama3.1 --search-provider duckduckgo
+term-ai "query" -w --model llama3.1 --search-provider serpapi
 # model: llama3.1 (CLI overrides env)
-# provider: duckduckgo (CLI overrides auto-detect)
+# provider: serpapi (CLI overrides auto-detect)
 ```
 
 ---
@@ -807,7 +822,7 @@ flowchart TD
 | Error | Cause | Message | Exit Code |
 |-------|-------|---------|-----------|
 | No prompt | No CLI arg or stdin | "No prompt provided via argument or stdin" | 1 |
-| Invalid provider | Unknown search provider | "Unknown search provider: 'xxx'. Valid options: duckduckgo, brave" | 1 |
+| Invalid provider | Unknown search provider | "Unknown search provider: 'xxx'. Valid options: brave, serpapi" | 1 |
 | Missing API key | Brave selected without key | "Brave search provider requires an API key..." | 1 |
 
 #### 2. Network Errors
@@ -1222,12 +1237,13 @@ Total: ~3-6 seconds
 ### Test Coverage
 
 ```
-13 unit tests total
+16 unit tests total
 
 CLI & Configuration:
 ├── test_build_prompt_includes_system_instructions
 ├── test_build_prompt_user_request_interpolation
-└── test_build_prompt_consistency
+├── test_build_prompt_consistency
+└── test_build_prompt_includes_current_date
 
 Chat API:
 ├── test_build_initial_messages
@@ -1235,11 +1251,13 @@ Chat API:
 └── test_build_tool_definitions
 
 Search Providers:
-├── test_provider_factory_duckduckgo
-├── test_provider_factory_auto_duckduckgo
 ├── test_provider_factory_auto_brave
+├── test_provider_factory_auto_serpapi
 ├── test_provider_factory_brave_with_key
 ├── test_provider_factory_brave_without_key
+├── test_provider_factory_serpapi_with_key
+├── test_provider_factory_serpapi_without_key
+├── test_provider_factory_no_keys
 └── test_provider_factory_invalid_provider
 
 Serialization:
@@ -1407,8 +1425,8 @@ fn build_tool_definitions() -> Vec<Tool> {
   ├── providers/       # Search providers
   │   ├── mod.rs
   │   ├── trait.rs
-  │   ├── duckduckgo.rs
-  │   └── brave.rs
+  │   ├── brave.rs
+  │   └── serpapi.rs
   └── tools/           # Tool execution
       ├── mod.rs
       └── web_search.rs
@@ -1439,36 +1457,36 @@ sequenceDiagram
     User->>CLI: Command + args
     CLI->>Loop: Start with messages array
 
-    Note over Loop: messages = [<br/>  {role: "system", content: "..."},<br/>  {role: "user", content: "what is the latest rust version"}<br/>]
+    Note over Loop: messages array initialized with<br/>system and user messages
 
-    Loop->>Ollama: POST /api/chat<br/>{messages, tools}
-    Ollama-->>Loop: {tool_calls: [{function: {name: "web_search", arguments: {query: "latest rust version"}}}]}
+    Loop->>Ollama: POST /api/chat (messages + tools)
+    Ollama-->>Loop: Response with tool_calls
 
     Note over Loop: Track query: "latest rust version"
 
     Loop->>Loop: Append assistant message with tool_calls
 
-    Note over Loop: messages.push({<br/>  role: "assistant",<br/>  tool_calls: [...]<br/>})
+    Note over Loop: Add assistant message to history
 
     Loop->>SerpApi: search("latest rust version", 5)
-    SerpApi-->>Loop: [SearchResult, SearchResult, ...]
+    SerpApi-->>Loop: Array of SearchResults
 
-    Note over Loop: Parse results for verbose:<br/>1. Rust 1.93 Release Notes<br/>2. Rust Blog Latest Version<br/>3. ...
+    Note over Loop: Parse results for verbose mode:<br/>Extract top 3 titles and snippets
 
     Loop->>Loop: JSON.stringify(results)
     Loop->>Loop: Append tool message
 
-    Note over Loop: messages.push({<br/>  role: "tool",<br/>  content: "[{title: ..., url: ..., snippet: ...}, ...]"<br/>})
+    Note over Loop: Add tool result to messages array
 
-    Loop->>Ollama: POST /api/chat<br/>{messages, tools}
+    Loop->>Ollama: POST /api/chat (messages + tools)
 
     Note over Ollama: Model processes search results
 
-    Ollama-->>Loop: {content: "1.93.0"}
+    Ollama-->>Loop: Final response: "1.93.0"
 
     Loop->>Loop: Format verbose output
 
-    Note over Loop: [Search]<br/>Searched for: latest rust version<br/><br/>[Sources]<br/>1. Rust 1.93 Release Notes...<br/><br/>[Command]<br/>1.93.0
+    Note over Loop: Format with Search, Sources,<br/>and Command sections
 
     Loop-->>CLI: Formatted output
     CLI-->>User: Display to stdout
