@@ -520,7 +520,7 @@ Contributions welcome! Please:
 
 ## License
 
-[Add your license here]
+MIT
 
 ## Author
 
