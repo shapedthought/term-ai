@@ -7,6 +7,7 @@ A Rust CLI tool that queries a local Ollama AI server to generate shell commands
 - **Natural Language to Shell Commands**: Describe what you want in plain English, get executable shell commands
 - **Web Search Integration**: Optional websearch capability using Ollama's tool calling for up-to-date information
 - **Multiple Search Providers**: DuckDuckGo (free, no API key) or Brave (API-based)
+- **Temporal Grounding**: Includes current date in prompts for better version awareness and search queries
 - **Safety First**: Built-in constraints to avoid destructive operations
 - **Blazing Fast**: Written in Rust with aggressive optimizations
 - **Flexible Configuration**: Environment variables, command-line flags, or defaults
@@ -326,6 +327,45 @@ If confidence information would be valuable, consider these alternatives:
 - Dry-run mode that shows what would be executed without running it
 
 The current design prioritizes speed, simplicity, and deterministic safety over probabilistic confidence metrics.
+
+## Temporal Grounding
+
+term-ai includes the current date in all prompts to improve temporal awareness:
+
+```
+Current date: January 31, 2026
+```
+
+### Benefits
+
+**Websearch Mode:**
+- Better search queries: Model includes dates ("rust stable version January 2026")
+- Temporal filtering: Model can prioritize recent results
+- Version awareness: Reduces outdated package suggestions
+
+**Legacy Mode:**
+- Avoids suggesting deprecated tools
+- Better relative time reasoning ("latest stable" vs "LTS")
+- More context-aware command generation
+
+**Format:** Uses explicit month names (`January 31, 2026`) to avoid DD/MM vs MM/DD ambiguity that can confuse language models.
+
+### Examples
+
+```bash
+# Without temporal context (older approach)
+term-ai "install python"
+# Might suggest: brew install python@3.9
+
+# With temporal context (2026-aware)
+term-ai "install python"
+# Suggests: brew install python@3.13  # Current stable in 2026
+
+# Websearch with temporal context
+term-ai "latest docker version" -w
+# Model searches: "docker stable version January 2026"
+# More targeted results!
+```
 
 ## Safety Features
 

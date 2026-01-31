@@ -248,7 +248,7 @@ impl SearchProvider for BraveProvider {
 
 /// Build the final prompt with system instructions and user request
 fn build_prompt(user_request: &str) -> String {
-    let current_date = Utc::now().format("%d/%m/%Y %H:%M").to_string();
+    let current_date = Utc::now().format("%B %d, %Y").to_string();
     format!(
         "You are an expert macOS terminal and development environment engineer.
 
@@ -258,12 +258,12 @@ Constraints:
 - Prefer Homebrew for package installation where appropriate.
 - Avoid destructive operations (no rm -rf, no disk formatting, no sudo unless clearly necessary and safe).
 
-Note: Today's date is {} (DD/MM/YYYY HH:MM).
+Current date: {}
 
 User request:
 {}",
-        user_request,
-        current_date
+        current_date,
+        user_request
     )
 }
 
@@ -350,7 +350,7 @@ fn create_search_provider(
 
 /// Build initial messages for chat API
 fn build_initial_messages(user_request: &str, _verbose: bool) -> Vec<Message> {
-    let current_date = Utc::now().format("%d/%m/%Y %H:%M").to_string();
+    let current_date = Utc::now().format("%B %d, %Y").to_string();
     // Note: verbose formatting is handled post-processing, not in the prompt
     let system_content = format!("You are an expert macOS terminal and development environment engineer.
 
@@ -362,7 +362,7 @@ Constraints:
 
 When you need current information (latest versions, recent releases, current documentation), use the web_search tool to find up-to-date information before responding.
 
-Note: Today's date is {} (DD/MM/YYYY HH:MM).", current_date);
+Current date: {}", current_date);
 
     vec![
         Message {
@@ -671,8 +671,25 @@ mod tests {
         let prompt1 = build_prompt(request);
         let prompt2 = build_prompt(request);
 
-        // Same request should produce identical prompts
+        // Same request should produce identical prompts (within same second)
         assert_eq!(prompt1, prompt2);
+    }
+
+    #[test]
+    fn test_build_prompt_includes_date() {
+        let request = "install rust";
+        let prompt = build_prompt(request);
+
+        // Verify date is included
+        assert!(prompt.contains("Current date:"));
+
+        // Verify format is readable (contains month name, not just numbers)
+        let month_names = [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December"
+        ];
+        let has_month = month_names.iter().any(|month| prompt.contains(month));
+        assert!(has_month, "Prompt should contain a month name");
     }
 
     #[test]
