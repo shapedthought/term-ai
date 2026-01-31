@@ -1,6 +1,5 @@
 use clap::Parser;
 use reqwest::blocking::Client;
-use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{self, Read};
@@ -28,13 +27,17 @@ struct Args {
     #[arg(long, short = 'w', alias = "ws")]
     websearch: bool,
 
-    /// Search provider to use (duckduckgo or brave). Auto-detects brave if BRAVE_API_KEY is set.
+    /// Search provider to use (brave or serpapi). Auto-detects if API key is set.
     #[arg(long)]
     search_provider: Option<String>,
 
-    /// Brave API key (or use BRAVE_API_KEY environment variable)
+    /// Brave Search API key (get at https://brave.com/search/api/)
     #[arg(long, env = "BRAVE_API_KEY")]
     brave_api_key: Option<String>,
+
+    /// SerpAPI key (get at https://serpapi.com/ - free tier: 100 searches/month)
+    #[arg(long, env = "SERPAPI_KEY")]
+    serpapi_key: Option<String>,
 
     /// Maximum number of search results to return
     #[arg(long, default_value = "5")]
@@ -127,11 +130,13 @@ trait SearchProvider {
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error>>;
 }
 
-struct DuckDuckGoProvider;
+struct SerpApiProvider {
+    api_key: String,
+}
 
-impl SearchProvider for DuckDuckGoProvider {
+impl SearchProvider for SerpApiProvider {
     fn name(&self) -> &str {
-        "duckduckgo"
+        "serpapi"
     }
 
     fn search(
@@ -141,50 +146,36 @@ impl SearchProvider for DuckDuckGoProvider {
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error>> {
         let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
-        let encoded_query = encode(query);
-        let url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
+        let url = format!(
+            "https://serpapi.com/search?q={}&api_key={}&num={}",
+            encode(query),
+            self.api_key,
+            max_results
+        );
 
         let response = client.get(&url).send()?;
 
         if !response.status().is_success() {
-            return Err(format!("DuckDuckGo returned status: {}", response.status()).into());
+            return Err(format!("SerpAPI returned status: {}", response.status()).into());
         }
 
-        let html = response.text()?;
-        let document = Html::parse_document(&html);
-
-        let result_selector = Selector::parse(".result").unwrap();
-        let title_selector = Selector::parse(".result__title").unwrap();
-        let url_selector = Selector::parse(".result__url").unwrap();
-        let snippet_selector = Selector::parse(".result__snippet").unwrap();
-
+        let json: serde_json::Value = response.json()?;
         let mut results = Vec::new();
 
-        for result in document.select(&result_selector).take(max_results) {
-            let title = result
-                .select(&title_selector)
-                .next()
-                .map(|e| e.text().collect::<String>().trim().to_string())
-                .unwrap_or_default();
+        // SerpAPI returns organic_results array
+        if let Some(organic) = json["organic_results"].as_array() {
+            for item in organic.iter().take(max_results) {
+                let title = item["title"].as_str().unwrap_or("").to_string();
+                let url = item["link"].as_str().unwrap_or("").to_string();
+                let snippet = item["snippet"].as_str().unwrap_or("").to_string();
 
-            let url = result
-                .select(&url_selector)
-                .next()
-                .map(|e| e.text().collect::<String>().trim().to_string())
-                .unwrap_or_default();
-
-            let snippet = result
-                .select(&snippet_selector)
-                .next()
-                .map(|e| e.text().collect::<String>().trim().to_string())
-                .unwrap_or_default();
-
-            if !title.is_empty() && !url.is_empty() {
-                results.push(SearchResult {
-                    title,
-                    url,
-                    snippet,
-                });
+                if !title.is_empty() && !url.is_empty() {
+                    results.push(SearchResult {
+                        title,
+                        url,
+                        snippet,
+                    });
+                }
             }
         }
 
@@ -317,20 +308,21 @@ fn get_user_prompt(cli_prompt: Option<String>) -> io::Result<String> {
 fn create_search_provider(
     args: &Args,
 ) -> Result<Box<dyn SearchProvider>, Box<dyn std::error::Error>> {
-    // Auto-detect provider: explicit flag > brave (if API key set) > duckduckgo
+    // Auto-detect provider: explicit flag > brave (if API key set) > serpapi (if API key set) > error
     let provider = match &args.search_provider {
         Some(p) => p.to_lowercase(),
         None => {
             if args.brave_api_key.is_some() {
                 "brave".to_string()
+            } else if args.serpapi_key.is_some() {
+                "serpapi".to_string()
             } else {
-                "duckduckgo".to_string()
+                return Err("No search provider API key found. Set BRAVE_API_KEY or SERPAPI_KEY environment variable, or use --brave-api-key or --serpapi-key flag.".into());
             }
         }
     };
 
     match provider.as_str() {
-        "duckduckgo" => Ok(Box::new(DuckDuckGoProvider)),
         "brave" => {
             if let Some(api_key) = &args.brave_api_key {
                 Ok(Box::new(BraveProvider {
@@ -340,8 +332,17 @@ fn create_search_provider(
                 Err("Brave search provider requires an API key. Provide via --brave-api-key or BRAVE_API_KEY environment variable.".into())
             }
         }
+        "serpapi" => {
+            if let Some(api_key) = &args.serpapi_key {
+                Ok(Box::new(SerpApiProvider {
+                    api_key: api_key.clone(),
+                }))
+            } else {
+                Err("SerpAPI requires an API key. Provide via --serpapi-key or SERPAPI_KEY environment variable. Get a free key at https://serpapi.com/".into())
+            }
+        }
         _ => Err(format!(
-            "Unknown search provider: '{}'. Valid options: duckduckgo, brave",
+            "Unknown search provider: '{}'. Valid options: brave, serpapi",
             provider
         )
         .into()),
@@ -748,25 +749,47 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_factory_duckduckgo() {
+    fn test_provider_factory_serpapi_with_key() {
         let args = Args {
             prompt: None,
             model: "llama3.2".to_string(),
             endpoint: "http://localhost:11434".to_string(),
             websearch: true,
-            search_provider: Some("duckduckgo".to_string()),
+            search_provider: Some("serpapi".to_string()),
             brave_api_key: None,
+            serpapi_key: Some("test-key".to_string()),
             max_results: 5,
             verbose: false,
         };
 
         let provider = create_search_provider(&args);
         assert!(provider.is_ok());
-        assert_eq!(provider.unwrap().name(), "duckduckgo");
+        assert_eq!(provider.unwrap().name(), "serpapi");
     }
 
     #[test]
-    fn test_provider_factory_auto_duckduckgo() {
+    fn test_provider_factory_serpapi_without_key() {
+        let args = Args {
+            prompt: None,
+            model: "llama3.2".to_string(),
+            endpoint: "http://localhost:11434".to_string(),
+            websearch: true,
+            search_provider: Some("serpapi".to_string()),
+            brave_api_key: None,
+            serpapi_key: None,
+            max_results: 5,
+            verbose: false,
+        };
+
+        let provider = create_search_provider(&args);
+        assert!(provider.is_err());
+        if let Err(e) = provider {
+            assert!(e.to_string().contains("API key"));
+        }
+    }
+
+    #[test]
+    fn test_provider_factory_auto_serpapi() {
         let args = Args {
             prompt: None,
             model: "llama3.2".to_string(),
@@ -774,13 +797,35 @@ mod tests {
             websearch: true,
             search_provider: None,
             brave_api_key: None,
+            serpapi_key: Some("test-key".to_string()),
             max_results: 5,
             verbose: false,
         };
 
         let provider = create_search_provider(&args);
         assert!(provider.is_ok());
-        assert_eq!(provider.unwrap().name(), "duckduckgo");
+        assert_eq!(provider.unwrap().name(), "serpapi");
+    }
+
+    #[test]
+    fn test_provider_factory_no_keys() {
+        let args = Args {
+            prompt: None,
+            model: "llama3.2".to_string(),
+            endpoint: "http://localhost:11434".to_string(),
+            websearch: true,
+            search_provider: None,
+            brave_api_key: None,
+            serpapi_key: None,
+            max_results: 5,
+            verbose: false,
+        };
+
+        let provider = create_search_provider(&args);
+        assert!(provider.is_err());
+        if let Err(e) = provider {
+            assert!(e.to_string().contains("No search provider API key found"));
+        }
     }
 
     #[test]
@@ -792,6 +837,7 @@ mod tests {
             websearch: true,
             search_provider: None,
             brave_api_key: Some("test-key".to_string()),
+            serpapi_key: None,
             max_results: 5,
             verbose: false,
         };
@@ -810,6 +856,7 @@ mod tests {
             websearch: true,
             search_provider: Some("brave".to_string()),
             brave_api_key: None,
+            serpapi_key: None,
             max_results: 5,
             verbose: false,
         };
@@ -830,6 +877,7 @@ mod tests {
             websearch: true,
             search_provider: Some("brave".to_string()),
             brave_api_key: Some("test-key".to_string()),
+            serpapi_key: None,
             max_results: 5,
             verbose: false,
         };
@@ -848,6 +896,7 @@ mod tests {
             websearch: true,
             search_provider: Some("invalid".to_string()),
             brave_api_key: None,
+            serpapi_key: None,
             max_results: 5,
             verbose: false,
         };

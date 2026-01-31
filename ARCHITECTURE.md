@@ -30,7 +30,6 @@
 | **reqwest** | 0.13.1 | HTTP client for Ollama API | blocking, json |
 | **serde** | 1.0 | Serialization/deserialization | derive |
 | **serde_json** | 1.0 | JSON handling | - |
-| **scraper** | 0.22 | HTML parsing (DuckDuckGo) | - |
 | **urlencoding** | 2.1 | URL encoding for search queries | - |
 | **chrono** | 0.4.43 | Date/time handling for temporal grounding | - |
 | **tokio** | 1.x | Async runtime (transitive dep) | rt-multi-thread |
@@ -117,7 +116,8 @@ classDiagram
         +search(query, max_results) Result
     }
 
-    class DuckDuckGoProvider {
+    class SerpApiProvider {
+        +String api_key
         +search() Result~Vec~SearchResult~~
     }
 
@@ -145,7 +145,7 @@ classDiagram
         +FunctionCall function
     }
 
-    SearchProvider <|.. DuckDuckGoProvider
+    SearchProvider <|.. SerpApiProvider
     SearchProvider <|.. BraveProvider
     ChatRequest --> Message
     Message --> ToolCall
@@ -178,8 +178,8 @@ trait SearchProvider {
 ```
 
 **Implementations:**
-- **DuckDuckGoProvider**: HTML scraping (free, bot detection issues)
-- **BraveProvider**: JSON API (requires API key, reliable)
+- **BraveProvider**: JSON API (privacy-focused, requires API key)
+- **SerpApiProvider**: JSON API (Google results, free tier 100/month)
 
 #### 3. Chat API Structures
 ```rust
@@ -345,75 +345,88 @@ flowchart TD
     Start[create_search_provider] --> ExplicitFlag{--search-provider<br/>provided?}
 
     ExplicitFlag -->|Yes| UseExplicit[Use specified provider]
-    ExplicitFlag -->|No| CheckAPIKey{BRAVE_API_KEY<br/>set?}
+    ExplicitFlag -->|No| CheckBrave{BRAVE_API_KEY<br/>set?}
 
-    CheckAPIKey -->|Yes| UseBrave[Auto-select Brave]
-    CheckAPIKey -->|No| UseDDG[Default to DuckDuckGo]
+    CheckBrave -->|Yes| UseBrave[Auto-select Brave]
+    CheckBrave -->|No| CheckSerpApi{SERPAPI_KEY<br/>set?}
+
+    CheckSerpApi -->|Yes| UseSerpApi[Auto-select SerpAPI]
+    CheckSerpApi -->|No| ErrorNoKey[Error: No API key]
 
     UseExplicit --> ValidateProvider{Valid provider?}
-    ValidateProvider -->|duckduckgo| CreateDDG[DuckDuckGoProvider]
-    ValidateProvider -->|brave| CheckKey{API key<br/>available?}
+    ValidateProvider -->|brave| CheckBraveKey{API key<br/>available?}
+    ValidateProvider -->|serpapi| CheckSerpKey{API key<br/>available?}
     ValidateProvider -->|other| ErrorInvalid[Error: Unknown provider]
 
-    CheckKey -->|Yes| CreateBrave[BraveProvider]
-    CheckKey -->|No| ErrorKey[Error: API key required]
+    CheckBraveKey -->|Yes| CreateBrave[BraveProvider]
+    CheckBraveKey -->|No| ErrorKey[Error: API key required]
+
+    CheckSerpKey -->|Yes| CreateSerpApi[SerpApiProvider]
+    CheckSerpKey -->|No| ErrorKey
 
     UseBrave --> CreateBrave
-    UseDDG --> CreateDDG
+    UseSerpApi --> CreateSerpApi
 
-    CreateDDG --> Return[Box&lt;dyn SearchProvider&gt;]
-    CreateBrave --> Return
+    CreateBrave --> Return[Box&lt;dyn SearchProvider&gt;]
+    CreateSerpApi --> Return
 
     style UseBrave fill:#ffe1cc
-    style UseDDG fill:#cce5ff
+    style UseSerpApi fill:#cce5ff
     style ErrorInvalid fill:#ffcccc
     style ErrorKey fill:#ffcccc
+    style ErrorNoKey fill:#ffcccc
 ```
 
-### DuckDuckGo Implementation
+### SerpAPI Implementation
 
-**Method**: HTML Scraping
+**Method**: JSON API
 
 ```mermaid
 sequenceDiagram
     participant Caller
-    participant DDG as DuckDuckGoProvider
-    participant HTTP
-    participant Scraper
+    participant SerpApi as SerpApiProvider
+    participant API as SerpAPI
 
-    Caller->>DDG: search("rust version", 5)
-    DDG->>DDG: URL encode query
-    DDG->>HTTP: GET https://html.duckduckgo.com/html/?q=...
+    Caller->>SerpApi: search("rust version", 5)
+    SerpApi->>SerpApi: URL encode query
+    SerpApi->>API: GET /search?q=...&api_key=...&num=5
 
-    alt Success (No CAPTCHA)
-        HTTP-->>DDG: HTML response
-        DDG->>Scraper: Parse HTML
-        Scraper->>Scraper: Select .result elements
-        Scraper->>Scraper: Extract .result__title
-        Scraper->>Scraper: Extract .result__url
-        Scraper->>Scraper: Extract .result__snippet
-        Scraper-->>DDG: Vec<SearchResult>
-    else Bot Detection
-        HTTP-->>DDG: CAPTCHA challenge HTML
-        DDG->>Scraper: Parse HTML
-        Scraper-->>DDG: Empty Vec (no .result elements)
+    alt Valid API Key
+        API-->>SerpApi: JSON { organic_results: [...] }
+        SerpApi->>SerpApi: Parse JSON
+        SerpApi->>SerpApi: Extract title, link, snippet
+        SerpApi->>SerpApi: Limit to max_results
+        SerpApi-->>Caller: Vec<SearchResult>
+    else Invalid API Key
+        API-->>SerpApi: 401 Unauthorized
+        SerpApi-->>Caller: Error: API returned status 401
     end
-
-    DDG-->>Caller: Vec<SearchResult>
 ```
 
-**CSS Selectors:**
-```css
-.result               /* Result container */
-.result__title        /* Title text */
-.result__url          /* URL text */
-.result__snippet      /* Description snippet */
+**JSON Response Structure:**
+```json
+{
+  "organic_results": [
+    {
+      "title": "Rust Programming Language",
+      "link": "https://www.rust-lang.org/",
+      "snippet": "A language empowering everyone..."
+    }
+  ]
+}
 ```
+
+**Advantages:**
+- ✅ Free tier (100 searches/month)
+- ✅ Google search results
+- ✅ Stable API contract
+- ✅ No bot detection
+- ✅ Reliable results
+- ✅ Proper JSON structure
 
 **Limitations:**
-- Bot detection (CAPTCHA challenges)
-- HTML structure changes break scraping
-- No guarantee of results
+- ⚠️ Rate limits (100/month free, paid beyond)
+- ⚠️ Requires API key
 
 ### Brave Implementation
 
@@ -835,9 +848,10 @@ let tool_result = match execute_tool(tool_call, provider, max_results) {
 ```
 
 **Error passed to model as tool result**, model continues execution:
-- DuckDuckGo CAPTCHA → Empty results
+- SerpAPI rate limit → Error message to model
 - Brave API rate limit → Error message to model
 - Network timeout → Error message to model
+- Invalid API key → Error message to model
 
 #### 5. Loop Protection
 **Infinite loop prevention**
@@ -960,14 +974,14 @@ provider.search("query", 5)?;  // Dynamic dispatch
 **Alternative considered**: Enum dispatch
 ```rust
 enum Provider {
-    DuckDuckGo,
-    Brave(String),  // API key
+    SerpApi(String),  // API key
+    Brave(String),    // API key
 }
 
 impl Provider {
     fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
         match self {
-            Provider::DuckDuckGo => { /* ... */ }
+            Provider::SerpApi(key) => { /* ... */ }
             Provider::Brave(key) => { /* ... */ }
         }
     }
@@ -1315,7 +1329,7 @@ brave_api_key: Option<String>,
 
 **All HTTP connections:**
 - ✅ Local Ollama: `http://localhost:11434` (local trust)
-- ✅ DuckDuckGo: `https://` (TLS)
+- ✅ SerpAPI: `https://` (TLS)
 - ✅ Brave API: `https://` (TLS)
 
 **Timeouts:**
@@ -1332,7 +1346,7 @@ Client::builder()
 
 | Enhancement | Complexity | Value | Priority |
 |-------------|------------|-------|----------|
-| **Google search provider** | Low | Medium | Low (Brave sufficient) |
+| **Additional search providers** | Low | Low | Low (SerpAPI + Brave sufficient) |
 | **Command history** | Medium | High | Medium |
 | **Dry-run mode** | Low | High | High |
 | **Explain mode** (`--explain`)  | Low | Medium | Medium |
@@ -1346,15 +1360,15 @@ Client::builder()
 **If adding more providers:**
 ```rust
 // Easy: Just implement trait
-struct GoogleProvider { api_key: String }
-impl SearchProvider for GoogleProvider { ... }
+struct TavilyProvider { api_key: String }
+impl SearchProvider for TavilyProvider { ... }
 
 // Auto-detection logic grows:
 let provider = match &args.search_provider {
     Some(p) => match p.as_str() {
-        "google" => create_google_provider()?,
+        "tavily" => create_tavily_provider()?,
         "brave" => create_brave_provider()?,
-        "duckduckgo" => create_ddg_provider()?,
+        "serpapi" => create_serpapi_provider()?,
         _ => return Err(...)
     },
     None => auto_detect_provider(&args)?  // Priority order
@@ -1420,7 +1434,7 @@ sequenceDiagram
     participant CLI
     participant Loop as chat_with_tools
     participant Ollama
-    participant DDG as DuckDuckGo
+    participant SerpApi as SerpAPI
 
     User->>CLI: Command + args
     CLI->>Loop: Start with messages array
@@ -1436,8 +1450,8 @@ sequenceDiagram
 
     Note over Loop: messages.push({<br/>  role: "assistant",<br/>  tool_calls: [...]<br/>})
 
-    Loop->>DDG: search("latest rust version", 5)
-    DDG-->>Loop: [SearchResult, SearchResult, ...]
+    Loop->>SerpApi: search("latest rust version", 5)
+    SerpApi-->>Loop: [SearchResult, SearchResult, ...]
 
     Note over Loop: Parse results for verbose:<br/>1. Rust 1.93 Release Notes<br/>2. Rust Blog Latest Version<br/>3. ...
 

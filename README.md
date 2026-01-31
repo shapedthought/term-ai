@@ -6,7 +6,7 @@ A Rust CLI tool that queries a local Ollama AI server to generate shell commands
 
 - **Natural Language to Shell Commands**: Describe what you want in plain English, get executable shell commands
 - **Web Search Integration**: Optional websearch capability using Ollama's tool calling for up-to-date information
-- **Multiple Search Providers**: DuckDuckGo (free, no API key) or Brave (API-based)
+- **Multiple Search Providers**: Brave Search (privacy-focused) or SerpAPI (Google results, free tier)
 - **Temporal Grounding**: Includes current date in prompts for better version awareness and search queries
 - **Safety First**: Built-in constraints to avoid destructive operations
 - **Blazing Fast**: Written in Rust with aggressive optimizations
@@ -84,9 +84,12 @@ export BRAVE_API_KEY=your_key_here
 term-ai "latest homebrew formulas" -w --model llama3.1
 # Automatically uses Brave search
 
+# Or use SerpAPI (free tier)
+export SERPAPI_KEY=your_key_here
+term-ai "latest homebrew formulas" -w --model llama3.1
+
 # Override with explicit provider
-term-ai "latest homebrew formulas" -w --search-provider duckduckgo --model llama3.1
-# Uses DuckDuckGo even if BRAVE_API_KEY is set
+term-ai "latest homebrew formulas" -w --search-provider serpapi --model llama3.1
 ```
 
 ## Configuration
@@ -130,11 +133,16 @@ Options:
           Enable websearch capabilities using tool calling
 
   --search-provider <SEARCH_PROVIDER>
-          Search provider to use (duckduckgo or brave)
-          Auto-detects brave if BRAVE_API_KEY is set
+          Search provider to use (brave or serpapi)
+          Auto-detects if API key is set (Brave > SerpAPI)
 
   --brave-api-key <BRAVE_API_KEY>
-          Brave API key [env: BRAVE_API_KEY=]
+          Brave Search API key [env: BRAVE_API_KEY=]
+          Get at: https://brave.com/search/api/
+
+  --serpapi-key <SERPAPI_KEY>
+          SerpAPI key [env: SERPAPI_KEY=]
+          Get at: https://serpapi.com/ (free tier: 100 searches/month)
 
   --max-results <MAX_RESULTS>
           Maximum number of search results to return [default: 5]
@@ -203,11 +211,16 @@ term-ai "install redis" -w -v --model llama3.1
 # brew install redis
 ```
 
-**Note:** DuckDuckGo (free) has bot detection that may prevent sources from displaying. For best verbose mode experience, use Brave search:
+**Note:** Both providers (Brave and SerpAPI) are API-based and will populate sources correctly in verbose mode.
 
 ```bash
+# With Brave
 export BRAVE_API_KEY=your_key
-term-ai "query" -w -v --model llama3.1  # Sources will populate with Brave
+term-ai "query" -w -v --model llama3.1
+
+# With SerpAPI (free tier)
+export SERPAPI_KEY=your_key
+term-ai "query" -w -v --model llama3.1
 ```
 
 ### Useful Aliases
@@ -232,40 +245,53 @@ The tool intelligently selects the search provider:
 
 1. **Explicit flag** takes highest priority: `--search-provider brave`
 2. **Auto-detect Brave** if `BRAVE_API_KEY` is set (no flag needed)
-3. **Default to DuckDuckGo** if no API key and no flag
+3. **Auto-detect SerpAPI** if `SERPAPI_KEY` is set (no flag needed)
+4. **Error** if no API key is found (requires one of the above)
 
-### DuckDuckGo (Default)
+### Brave Search (Recommended for Privacy)
 
-- **Free**: No API key required
-- **Unlimited**: No rate limits
-- **Method**: HTML scraping
-- **Limitations**:
-  - Bot detection may prevent results from being returned
-  - Verbose mode may show "No results found" due to CAPTCHA challenges
-  - HTML structure changes may break scraping
-
-```bash
-# Auto-selected when no API key is set
-term-ai "latest news" -w --model llama3.1
-
-# Works for generating commands, but verbose mode may not show sources
-term-ai "install docker" -w -v --model llama3.1
-```
-
-### Brave Search
-
+- **Privacy-focused**: Independent search engine, no Google tracking
 - **API-based**: Requires API key from [Brave Search API](https://brave.com/search/api/)
 - **Reliable**: Stable JSON API
 - **Rate-limited**: Depends on your API plan
-- **Auto-detected**: Automatically used when `BRAVE_API_KEY` is set
+- **Auto-detected**: Automatically used when `BRAVE_API_KEY` is set (highest priority)
 
 ```bash
 # Set API key - Brave is now auto-selected for all websearch queries
 export BRAVE_API_KEY=your_key_here
 term-ai "latest releases" -w --model llama3.1  # Uses Brave automatically
+```
 
-# Override to use DuckDuckGo even with API key set
-term-ai "query" -w --search-provider duckduckgo --model llama3.1
+### SerpAPI (Recommended for Free Tier)
+
+- **Free tier**: 100 searches/month (no credit card required)
+- **Google results**: Aggregates Google, Bing, and other search engines
+- **API-based**: Clean REST interface
+- **Reliable**: Well-established, used by many AI applications
+- **Get key**: Sign up at [serpapi.com](https://serpapi.com/)
+
+```bash
+# Set API key - SerpAPI auto-selected if no Brave key
+export SERPAPI_KEY=your_key_here
+term-ai "latest python version" -w --model llama3.1
+
+# Explicit provider selection
+term-ai "query" -w --search-provider serpapi --model llama3.1
+```
+
+### Provider Priority
+
+When multiple API keys are set:
+
+```bash
+export BRAVE_API_KEY=xxx
+export SERPAPI_KEY=yyy
+
+# Auto-selects Brave (highest priority)
+term-ai "query" -w
+
+# Force SerpAPI with explicit flag
+term-ai "query" -w --search-provider serpapi
 ```
 
 ## Model Compatibility
@@ -435,13 +461,26 @@ ollama pull llama3.1
 term-ai "query" --websearch --model llama3.1
 ```
 
-### DuckDuckGo Search Failing
+### Search Provider Errors
 
-**Cause**: HTML structure changed or network issues
+**Cause**: Missing API key or invalid key
 
 **Solution**:
-- Try Brave search instead (requires API key)
-- Or use legacy mode without websearch
+```bash
+# Set at least one API key
+export BRAVE_API_KEY=your_brave_key
+# OR
+export SERPAPI_KEY=your_serpapi_key
+
+# Verify it's set
+echo $BRAVE_API_KEY
+echo $SERPAPI_KEY
+```
+
+**SerpAPI Free Tier:**
+- Sign up at https://serpapi.com/ (no credit card required)
+- 100 free searches/month
+- Perfect for personal CLI usage
 
 ### Ollama Not Responding
 
