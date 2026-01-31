@@ -14,6 +14,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 scraper = "0.22"
 urlencoding = "2.1"
+chrono = "0.4.43"
 
 [profile.release]
 opt-level = 3

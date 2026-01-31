@@ -138,6 +138,9 @@ Options:
   --max-results <MAX_RESULTS>
           Maximum number of search results to return [default: 5]
 
+  -v, --verbose
+          Show detailed output including search results and reasoning
+
   -h, --help
           Print help
 ```
@@ -179,6 +182,33 @@ term-ai "find process using port 3000" --model llama3.1
 # Output: lsof -i :3000
 ```
 
+### Verbose Mode
+
+Show detailed output including search information and sources:
+
+```bash
+# Verbose output shows what was searched and sources used
+term-ai "install redis" -w -v --model llama3.1
+
+# Output format:
+# [Search]
+# Searched for: install redis methods
+#
+# [Sources]
+# 1. Redis via Homebrew - redis.io
+# 2. Latest Redis version...
+#
+# [Command]
+# brew install redis
+```
+
+**Note:** DuckDuckGo (free) has bot detection that may prevent sources from displaying. For best verbose mode experience, use Brave search:
+
+```bash
+export BRAVE_API_KEY=your_key
+term-ai "query" -w -v --model llama3.1  # Sources will populate with Brave
+```
+
 ### Useful Aliases
 
 Add these to your shell profile for convenience:
@@ -187,10 +217,12 @@ Add these to your shell profile for convenience:
 # Quick aliases
 alias tai='term-ai --model llama3.1'
 alias tais='term-ai --model llama3.1 -w'  # Short for "tai search"
+alias taiv='term-ai --model llama3.1 -w -v'  # Verbose search
 
 # Usage
 tai "install redis"
 tais "latest python version 2026"
+taiv "how do I install docker"  # Shows sources
 ```
 
 ## Search Providers
@@ -206,11 +238,17 @@ The tool intelligently selects the search provider:
 - **Free**: No API key required
 - **Unlimited**: No rate limits
 - **Method**: HTML scraping
-- **Note**: May be less reliable if DuckDuckGo changes their HTML structure
+- **Limitations**:
+  - Bot detection may prevent results from being returned
+  - Verbose mode may show "No results found" due to CAPTCHA challenges
+  - HTML structure changes may break scraping
 
 ```bash
 # Auto-selected when no API key is set
 term-ai "latest news" -w --model llama3.1
+
+# Works for generating commands, but verbose mode may not show sources
+term-ai "install docker" -w -v --model llama3.1
 ```
 
 ### Brave Search

@@ -6,6 +6,7 @@ use serde_json::json;
 use std::io::{self, Read};
 use std::time::Duration;
 use urlencoding::encode;
+use chrono::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(name = "term-ai")]
@@ -38,6 +39,10 @@ struct Args {
     /// Maximum number of search results to return
     #[arg(long, default_value = "5")]
     max_results: usize,
+
+    /// Show detailed output including search results and reasoning
+    #[arg(long, short = 'v')]
+    verbose: bool,
 }
 
 #[derive(Serialize)]
@@ -106,7 +111,7 @@ struct FunctionCall {
 }
 
 // Search provider structures
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct SearchResult {
     title: String,
     url: String,
@@ -243,6 +248,7 @@ impl SearchProvider for BraveProvider {
 
 /// Build the final prompt with system instructions and user request
 fn build_prompt(user_request: &str) -> String {
+    let current_date = Utc::now().format("%d/%m/%Y %H:%M").to_string();
     format!(
         "You are an expert macOS terminal and development environment engineer.
 
@@ -252,9 +258,12 @@ Constraints:
 - Prefer Homebrew for package installation where appropriate.
 - Avoid destructive operations (no rm -rf, no disk formatting, no sudo unless clearly necessary and safe).
 
+Note: Today's date is {} (DD/MM/YYYY HH:MM).
+
 User request:
 {}",
-        user_request
+        user_request,
+        current_date
     )
 }
 
@@ -340,11 +349,10 @@ fn create_search_provider(
 }
 
 /// Build initial messages for chat API
-fn build_initial_messages(user_request: &str) -> Vec<Message> {
-    vec![
-        Message {
-            role: "system".to_string(),
-            content: "You are an expert macOS terminal and development environment engineer.
+fn build_initial_messages(user_request: &str, _verbose: bool) -> Vec<Message> {
+    let current_date = Utc::now().format("%d/%m/%Y %H:%M").to_string();
+    // Note: verbose formatting is handled post-processing, not in the prompt
+    let system_content = format!("You are an expert macOS terminal and development environment engineer.
 
 Constraints:
 - Respond ONLY with valid shell commands, one per line.
@@ -352,7 +360,14 @@ Constraints:
 - Prefer Homebrew for package installation where appropriate.
 - Avoid destructive operations (no rm -rf, no disk formatting, no sudo unless clearly necessary and safe).
 
-When you need current information (latest versions, recent releases, current documentation), use the web_search tool to find up-to-date information before responding.".to_string(),
+When you need current information (latest versions, recent releases, current documentation), use the web_search tool to find up-to-date information before responding.
+
+Note: Today's date is {} (DD/MM/YYYY HH:MM).", current_date);
+
+    vec![
+        Message {
+            role: "system".to_string(),
+            content: system_content,
             tool_calls: None,
         },
         Message {
@@ -444,10 +459,15 @@ fn chat_with_tools(
     endpoint: &str,
     provider: &dyn SearchProvider,
     max_results: usize,
+    verbose: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut messages = build_initial_messages(user_request);
+    let mut messages = build_initial_messages(user_request, verbose);
     let tools = build_tool_definitions();
     const MAX_ITERATIONS: usize = 10;
+
+    // Track searches for verbose output
+    let mut search_queries: Vec<String> = Vec::new();
+    let mut search_results_summary: Vec<String> = Vec::new();
 
     for _iteration in 0..MAX_ITERATIONS {
         let response = call_ollama_chat(&messages, Some(tools.clone()), model, endpoint)?;
@@ -460,8 +480,48 @@ fn chat_with_tools(
 
                 // Execute each tool call
                 for tool_call in tool_calls {
+                    // Track search query for verbose mode
+                    if tool_call.function.name == "web_search" {
+                        if let Some(query) = tool_call.function.arguments["query"].as_str() {
+                            search_queries.push(query.to_string());
+                        }
+                    }
+
                     let tool_result = match execute_tool(tool_call, provider, max_results) {
-                        Ok(result) => result,
+                        Ok(result) => {
+                            // Parse and summarize results for verbose mode
+                            if verbose && tool_call.function.name == "web_search" {
+                                match serde_json::from_str::<Vec<SearchResult>>(&result) {
+                                    Ok(results) => {
+                                        if results.is_empty() {
+                                            search_results_summary
+                                                .push("No results found from search".to_string());
+                                        } else {
+                                            for (i, res) in results.iter().take(3).enumerate() {
+                                                search_results_summary.push(format!(
+                                                    "{}. {} - {}",
+                                                    i + 1,
+                                                    res.title,
+                                                    if res.snippet.len() > 100 {
+                                                        format!("{}...", &res.snippet[..100])
+                                                    } else {
+                                                        res.snippet.clone()
+                                                    }
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        // Fallback: show that results were returned but couldn't be parsed
+                                        search_results_summary.push(format!(
+                                            "Search returned results (parse error: {})",
+                                            e
+                                        ));
+                                    }
+                                }
+                            }
+                            result
+                        }
                         Err(e) => format!("Error executing tool: {}", e),
                     };
 
@@ -479,7 +539,37 @@ fn chat_with_tools(
         }
 
         // No tool calls, return the final response
-        return Ok(response.message.content);
+        let final_response = response.message.content;
+
+        if verbose {
+            // Format verbose output
+            let mut output = String::new();
+
+            output.push_str("[Search]\n");
+            if search_queries.is_empty() {
+                output.push_str("No search required\n");
+            } else {
+                output.push_str(&format!("Searched for: {}\n", search_queries.join(", ")));
+            }
+            output.push('\n');
+
+            output.push_str("[Sources]\n");
+            if search_results_summary.is_empty() {
+                output.push_str("N/A\n");
+            } else {
+                for result in &search_results_summary {
+                    output.push_str(&format!("{}\n", result));
+                }
+            }
+            output.push('\n');
+
+            output.push_str("[Command]\n");
+            output.push_str(&final_response);
+
+            return Ok(output);
+        } else {
+            return Ok(final_response);
+        }
     }
 
     Err(format!(
@@ -517,6 +607,7 @@ fn main() {
             &args.endpoint,
             provider.as_ref(),
             args.max_results,
+            args.verbose,
         )
     } else {
         // Legacy mode - backward compatible
@@ -587,7 +678,7 @@ mod tests {
     #[test]
     fn test_build_initial_messages() {
         let user_request = "install rust";
-        let messages = build_initial_messages(user_request);
+        let messages = build_initial_messages(user_request, false);
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
@@ -595,6 +686,18 @@ mod tests {
         assert!(messages[0].content.contains("web_search tool"));
         assert_eq!(messages[1].role, "user");
         assert_eq!(messages[1].content, "install rust");
+    }
+
+    #[test]
+    fn test_build_initial_messages_verbose() {
+        let user_request = "install rust";
+        let messages_verbose = build_initial_messages(user_request, true);
+        let messages_normal = build_initial_messages(user_request, false);
+
+        // Verbose flag doesn't change the prompt (formatting is done post-processing)
+        assert_eq!(messages_verbose.len(), 2);
+        assert_eq!(messages_verbose[0].content, messages_normal[0].content);
+        assert_eq!(messages_verbose[1].content, "install rust");
     }
 
     #[test]
@@ -637,6 +740,7 @@ mod tests {
             search_provider: Some("duckduckgo".to_string()),
             brave_api_key: None,
             max_results: 5,
+            verbose: false,
         };
 
         let provider = create_search_provider(&args);
@@ -654,6 +758,7 @@ mod tests {
             search_provider: None,
             brave_api_key: None,
             max_results: 5,
+            verbose: false,
         };
 
         let provider = create_search_provider(&args);
@@ -671,6 +776,7 @@ mod tests {
             search_provider: None,
             brave_api_key: Some("test-key".to_string()),
             max_results: 5,
+            verbose: false,
         };
 
         let provider = create_search_provider(&args);
@@ -688,6 +794,7 @@ mod tests {
             search_provider: Some("brave".to_string()),
             brave_api_key: None,
             max_results: 5,
+            verbose: false,
         };
 
         let provider = create_search_provider(&args);
@@ -707,6 +814,7 @@ mod tests {
             search_provider: Some("brave".to_string()),
             brave_api_key: Some("test-key".to_string()),
             max_results: 5,
+            verbose: false,
         };
 
         let provider = create_search_provider(&args);
@@ -724,6 +832,7 @@ mod tests {
             search_provider: Some("invalid".to_string()),
             brave_api_key: None,
             max_results: 5,
+            verbose: false,
         };
 
         let provider = create_search_provider(&args);
