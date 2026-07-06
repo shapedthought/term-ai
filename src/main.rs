@@ -1,11 +1,11 @@
+use chrono::prelude::*;
 use clap::Parser;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::time::Duration;
 use urlencoding::encode;
-use chrono::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(name = "term-ai")]
@@ -55,9 +55,14 @@ struct OllamaRequest {
     stream: bool,
 }
 
+/// One NDJSON line of Ollama's streaming /api/generate response
 #[derive(Deserialize)]
-struct OllamaResponse {
+struct StreamChunk {
+    #[serde(default)]
     response: String,
+    #[serde(default)]
+    done: bool,
+    error: Option<String>,
 }
 
 // Chat API structures
@@ -258,11 +263,13 @@ User request:
     )
 }
 
-/// Call the Ollama API and return the response
+/// Call the Ollama API, streaming each token to `out` as it arrives.
+/// Returns the full accumulated response.
 fn call_ollama(
     prompt: &str,
     model: &str,
     endpoint: &str,
+    out: &mut dyn Write,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let client = Client::new();
     let url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
@@ -270,7 +277,7 @@ fn call_ollama(
     let request_body = OllamaRequest {
         model: model.to_string(),
         prompt: prompt.to_string(),
-        stream: false,
+        stream: true,
     };
 
     let response = client.post(&url).json(&request_body).send()?;
@@ -279,8 +286,33 @@ fn call_ollama(
         return Err(format!("Ollama returned status: {}", response.status()).into());
     }
 
-    let ollama_response: OllamaResponse = response.json()?;
-    Ok(ollama_response.response)
+    let reader = BufReader::new(response);
+    let mut full_response = String::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let chunk: StreamChunk = serde_json::from_str(&line)?;
+
+        if let Some(error) = chunk.error {
+            return Err(format!("Ollama error: {}", error).into());
+        }
+
+        if !chunk.response.is_empty() {
+            write!(out, "{}", chunk.response)?;
+            out.flush()?;
+            full_response.push_str(&chunk.response);
+        }
+
+        if chunk.done {
+            break;
+        }
+    }
+
+    Ok(full_response)
 }
 
 /// Get the user prompt from either command-line argument or stdin
@@ -592,8 +624,9 @@ fn main() {
         }
     };
 
-    let response = if args.websearch {
-        // Websearch mode with tool calling
+    let result = if args.websearch {
+        // Websearch mode with tool calling - buffered (tool-call handling
+        // and verbose formatting need the complete response)
         let provider = match create_search_provider(&args) {
             Ok(p) => p,
             Err(e) => {
@@ -610,20 +643,22 @@ fn main() {
             args.max_results,
             args.verbose,
         )
+        .map(|text| println!("{}", text))
     } else {
-        // Legacy mode - backward compatible
+        // Default mode - streams tokens to stdout as they arrive
         let final_prompt = build_prompt(&user_prompt);
-        call_ollama(&final_prompt, &args.model, &args.endpoint)
+        call_ollama(
+            &final_prompt,
+            &args.model,
+            &args.endpoint,
+            &mut io::stdout(),
+        )
+        .map(|_| println!())
     };
 
-    match response {
-        Ok(text) => {
-            println!("{}", text);
-        }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
     }
 }
 
@@ -686,8 +721,18 @@ mod tests {
 
         // Verify format is readable (contains month name, not just numbers)
         let month_names = [
-            "January", "February", "March", "April", "May", "June",
-            "July", "August", "September", "October", "November", "December"
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
         ];
         let has_month = month_names.iter().any(|month| prompt.contains(month));
         assert!(has_month, "Prompt should contain a month name");
@@ -732,6 +777,36 @@ mod tests {
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["query"].is_object());
         assert_eq!(params["required"][0], "query");
+    }
+
+    #[test]
+    fn test_stream_chunk_parsing() {
+        let chunk: StreamChunk =
+            serde_json::from_str(r#"{"model":"llama3.2","response":"brew ","done":false}"#)
+                .unwrap();
+        assert_eq!(chunk.response, "brew ");
+        assert!(!chunk.done);
+        assert!(chunk.error.is_none());
+    }
+
+    #[test]
+    fn test_stream_chunk_final() {
+        // Final chunk has done:true, an empty response, and extra stats fields
+        let chunk: StreamChunk = serde_json::from_str(
+            r#"{"model":"llama3.2","response":"","done":true,"total_duration":123,"eval_count":42}"#,
+        )
+        .unwrap();
+        assert_eq!(chunk.response, "");
+        assert!(chunk.done);
+    }
+
+    #[test]
+    fn test_stream_chunk_error() {
+        let chunk: StreamChunk =
+            serde_json::from_str(r#"{"error":"model 'nope' not found"}"#).unwrap();
+        assert_eq!(chunk.error.as_deref(), Some("model 'nope' not found"));
+        assert_eq!(chunk.response, "");
+        assert!(!chunk.done);
     }
 
     #[test]
