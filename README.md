@@ -92,6 +92,47 @@ term-ai "latest homebrew formulas" -w --model llama3.1
 term-ai "latest homebrew formulas" -w --search-provider serpapi --model llama3.1
 ```
 
+### Execute Mode
+
+Run the generated command directly, with a confirmation prompt:
+
+```bash
+$ term-ai "install redis" --execute
+brew install redis
+Execute? [y/N]: y
+✓ Executed successfully
+
+# Skip confirmation for trusted prompts
+term-ai "install redis" -x -y
+```
+
+The command runs in your shell (`$SHELL`) and term-ai exits with the
+command's exit code. Commands flagged by the safety linter always require
+interactive confirmation, even with `--yes`.
+
+Preview without running:
+
+```bash
+$ term-ai "delete all log files" --dry-run
+find . -name "*.log" -type f -delete
+
+⚠️  Preview only. Add --execute to run.
+```
+
+### Explain Mode
+
+Understand the command before you run it:
+
+```bash
+$ term-ai "find large files" --explain
+find . -type f -size +100M
+
+Explanation:
+• find . : search starting from the current directory
+• -type f : only files, not directories
+• -size +100M : larger than 100 megabytes
+```
+
 ### Fix Mode
 
 Suggest a correction for the last failed shell command:
@@ -201,6 +242,19 @@ Options:
           recorded by the zsh integration (falling back to shell history);
           pipe error output via stdin for better results. The PROMPT argument
           becomes an extra hint (e.g. the error message you saw)
+
+  -x, --execute
+          Execute the generated command after confirmation
+
+  -y, --yes
+          Skip the confirmation prompt when executing (dangerous commands
+          still require interactive confirmation)
+
+  -n, --dry-run
+          Show what would be executed without running it
+
+  --explain
+          Include a breakdown of what each part of the command does
 
   -h, --help
           Print help

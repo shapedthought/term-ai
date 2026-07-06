@@ -71,6 +71,11 @@ struct Args {
     /// Show what would be executed without running it
     #[arg(long, short = 'n', conflicts_with = "execute")]
     dry_run: bool,
+
+    /// Include a breakdown of what each part of the command does
+    /// (no short form: -e is taken by --endpoint)
+    #[arg(long, conflicts_with = "execute")]
+    explain: bool,
 }
 
 #[derive(Serialize)]
@@ -268,14 +273,13 @@ impl SearchProvider for BraveProvider {
 }
 
 /// Build the final prompt with system instructions and user request
-fn build_prompt(user_request: &str) -> String {
+fn build_prompt(user_request: &str, explain: bool) -> String {
     let current_date = Utc::now().format("%B %d, %Y").to_string();
     format!(
         "You are an expert macOS terminal and development environment engineer.
 
 Constraints:
-- Respond ONLY with valid shell commands, one per line.
-- Do not include explanations, comments, Markdown, or prose.
+{}
 - Prefer Homebrew for package installation where appropriate.
 - Avoid destructive operations (no rm -rf, no disk formatting, no sudo unless clearly necessary and safe).
 
@@ -283,9 +287,22 @@ Current date: {}
 
 User request:
 {}",
+        format_rules(explain),
         current_date,
         user_request
     )
+}
+
+/// Output-format rules for the system prompt, depending on explain mode
+fn format_rules(explain: bool) -> &'static str {
+    if explain {
+        "- Start with ONLY the shell command(s), one per line.
+- After the commands, add a section starting with the exact line \"Explanation:\" containing one bullet per part of the command, in the format \"• <part> : <what it does>\".
+- No other prose or Markdown."
+    } else {
+        "- Respond ONLY with valid shell commands, one per line.
+- Do not include explanations, comments, Markdown, or prose."
+    }
 }
 
 /// Check a single command line against deny-patterns for destructive
@@ -410,9 +427,15 @@ fn lint_commands(output: &str) -> Vec<String> {
         .collect()
 }
 
+/// The command part of the output — everything before an "Explanation:"
+/// section added by --explain mode
+fn command_portion(output: &str) -> &str {
+    output.split("\nExplanation:").next().unwrap_or(output)
+}
+
 /// Print safety warnings for dangerous commands to stderr
 fn print_safety_warnings(output: &str) {
-    let warnings = lint_commands(output);
+    let warnings = lint_commands(command_portion(output));
     if !warnings.is_empty() {
         eprintln!();
         for warning in warnings {
@@ -816,20 +839,18 @@ fn create_search_provider(
 }
 
 /// Build initial messages for chat API
-fn build_initial_messages(user_request: &str, _verbose: bool) -> Vec<Message> {
+fn build_initial_messages(user_request: &str, explain: bool) -> Vec<Message> {
     let current_date = Utc::now().format("%B %d, %Y").to_string();
-    // Note: verbose formatting is handled post-processing, not in the prompt
     let system_content = format!("You are an expert macOS terminal and development environment engineer.
 
 Constraints:
-- Respond ONLY with valid shell commands, one per line.
-- Do not include explanations, comments, Markdown, or prose.
+{}
 - Prefer Homebrew for package installation where appropriate.
 - Avoid destructive operations (no rm -rf, no disk formatting, no sudo unless clearly necessary and safe).
 
 When you need current information (latest versions, recent releases, current documentation), use the web_search tool to find up-to-date information before responding.
 
-Current date: {}", current_date);
+Current date: {}", format_rules(explain), current_date);
 
     vec![
         Message {
@@ -929,8 +950,9 @@ fn chat_with_tools(
     provider: &dyn SearchProvider,
     max_results: usize,
     verbose: bool,
+    explain: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut messages = build_initial_messages(user_request, verbose);
+    let mut messages = build_initial_messages(user_request, explain);
     let tools = build_tool_definitions();
     const MAX_ITERATIONS: usize = 10;
 
@@ -1137,6 +1159,7 @@ fn main() {
             provider.as_ref(),
             args.max_results,
             args.verbose,
+            args.explain,
         )
         .map(|text| {
             println!("{}", text);
@@ -1144,7 +1167,7 @@ fn main() {
         })
     } else {
         // Default mode - streams tokens to stdout as they arrive
-        let final_prompt = build_prompt(&user_prompt);
+        let final_prompt = build_prompt(&user_prompt, args.explain);
         call_ollama(
             &final_prompt,
             &args.model,
@@ -1178,7 +1201,7 @@ mod tests {
     #[test]
     fn test_build_prompt_includes_system_instructions() {
         let user_request = "install rust";
-        let prompt = build_prompt(user_request);
+        let prompt = build_prompt(user_request, false);
 
         // Verify system prompt is included
         assert!(prompt.contains("You are an expert macOS terminal"));
@@ -1201,8 +1224,8 @@ mod tests {
         let request1 = "setup zsh";
         let request2 = "install node";
 
-        let prompt1 = build_prompt(request1);
-        let prompt2 = build_prompt(request2);
+        let prompt1 = build_prompt(request1, false);
+        let prompt2 = build_prompt(request2, false);
 
         assert!(prompt1.contains(request1));
         assert!(prompt2.contains(request2));
@@ -1213,8 +1236,8 @@ mod tests {
     #[test]
     fn test_build_prompt_consistency() {
         let request = "test request";
-        let prompt1 = build_prompt(request);
-        let prompt2 = build_prompt(request);
+        let prompt1 = build_prompt(request, false);
+        let prompt2 = build_prompt(request, false);
 
         // Same request should produce identical prompts (within same second)
         assert_eq!(prompt1, prompt2);
@@ -1223,7 +1246,7 @@ mod tests {
     #[test]
     fn test_build_prompt_includes_date() {
         let request = "install rust";
-        let prompt = build_prompt(request);
+        let prompt = build_prompt(request, false);
 
         // Verify date is included
         assert!(prompt.contains("Current date:"));
@@ -1261,15 +1284,47 @@ mod tests {
     }
 
     #[test]
-    fn test_build_initial_messages_verbose() {
+    fn test_build_initial_messages_explain() {
         let user_request = "install rust";
-        let messages_verbose = build_initial_messages(user_request, true);
+        let messages_explain = build_initial_messages(user_request, true);
         let messages_normal = build_initial_messages(user_request, false);
 
-        // Verbose flag doesn't change the prompt (formatting is done post-processing)
-        assert_eq!(messages_verbose.len(), 2);
-        assert_eq!(messages_verbose[0].content, messages_normal[0].content);
-        assert_eq!(messages_verbose[1].content, "install rust");
+        assert_eq!(messages_explain.len(), 2);
+        assert!(messages_explain[0].content.contains("Explanation:"));
+        assert!(!messages_normal[0].content.contains("Explanation:"));
+        assert_eq!(messages_explain[1].content, "install rust");
+    }
+
+    #[test]
+    fn test_build_prompt_explain() {
+        let prompt = build_prompt("find large files", true);
+        assert!(prompt.contains("Explanation:"));
+        assert!(prompt.contains("one bullet per part"));
+        // Safety constraint applies in both modes
+        assert!(prompt.contains("Avoid destructive operations"));
+
+        let normal = build_prompt("find large files", false);
+        assert!(normal.contains("Respond ONLY with valid shell commands"));
+        assert!(!normal.contains("Explanation:"));
+    }
+
+    #[test]
+    fn test_command_portion() {
+        let explained = "find . -size +100M\n\nExplanation:\n• find . : search here\n• curl x | sh : just explaining, not a command";
+        assert_eq!(command_portion(explained), "find . -size +100M\n");
+        assert_eq!(command_portion("brew install jq"), "brew install jq");
+
+        // Linter only sees the command part: dangerous text in the
+        // explanation doesn't warn, dangerous commands still do
+        assert!(lint_commands(command_portion(explained)).is_empty());
+        let dangerous = "rm -rf /usr/local/foo\n\nExplanation:\n• harmless text";
+        assert_eq!(lint_commands(command_portion(dangerous)).len(), 1);
+    }
+
+    #[test]
+    fn test_explain_flag_conflicts_with_execute() {
+        assert!(Args::try_parse_from(["term-ai", "x", "--explain", "--execute"]).is_err());
+        assert!(Args::try_parse_from(["term-ai", "x", "--explain"]).is_ok());
     }
 
     #[test]
@@ -1585,6 +1640,7 @@ mod tests {
             execute: false,
             yes: false,
             dry_run: false,
+            explain: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1609,6 +1665,7 @@ mod tests {
             execute: false,
             yes: false,
             dry_run: false,
+            explain: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1635,6 +1692,7 @@ mod tests {
             execute: false,
             yes: false,
             dry_run: false,
+            explain: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1659,6 +1717,7 @@ mod tests {
             execute: false,
             yes: false,
             dry_run: false,
+            explain: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1685,6 +1744,7 @@ mod tests {
             execute: false,
             yes: false,
             dry_run: false,
+            explain: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1709,6 +1769,7 @@ mod tests {
             execute: false,
             yes: false,
             dry_run: false,
+            explain: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1735,6 +1796,7 @@ mod tests {
             execute: false,
             yes: false,
             dry_run: false,
+            explain: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1759,6 +1821,7 @@ mod tests {
             execute: false,
             yes: false,
             dry_run: false,
+            explain: false,
         };
 
         let provider = create_search_provider(&args);
