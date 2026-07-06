@@ -27,6 +27,107 @@ Transform term-ai from a single-shot command generator into an intelligent, inte
 
 ## Phases
 
+### Phase 0: Foundations & Safety
+**Timeline**: ~1 week
+**Goal**: Make the tool feel fast, safe, and reliable before adding execution features
+
+#### 0.1 Streaming Output ⭐⭐⭐⭐⭐
+**Priority**: CRITICAL
+**Complexity**: Low
+**Effort**: 1 day
+
+**Feature:**
+Print tokens as they arrive instead of waiting for the full response. Local models can take 5–15 seconds; streaming is the difference between "feels broken" and "feels alive".
+
+**Implementation:**
+- Set `stream: true` in Ollama requests
+- Read newline-delimited JSON from the response body
+- Print each `response` fragment as it arrives, flush stdout
+- Buffer full output when post-processing is needed (verbose mode, safety linter)
+
+**Files Modified:**
+- `src/main.rs`: Streaming read loop (~60 lines)
+
+---
+
+#### 0.2 Safety Linter for Generated Commands ⭐⭐⭐⭐⭐
+**Priority**: CRITICAL (prerequisite for 1.1 Command Execution)
+**Complexity**: Low
+**Effort**: 1 day
+
+**Feature:**
+```bash
+term-ai "free up disk space"
+⚠️  DANGEROUS: rm -rf ~/Library/Caches/*
+This command matches a destructive pattern (recursive delete).
+```
+
+Safety currently lives only in the system prompt, which small local models can ignore. Check generated output against deny-patterns before printing (and later, before executing).
+
+**Implementation:**
+- Deny-pattern checks: `rm -rf` near `/` or `~`, `dd of=/dev/`, `curl ... | sh`, `chmod -R 777`, fork bombs, `mkfs`, `> /dev/sda`
+- Prominent warning on match; require explicit confirmation once `--execute` exists
+- Unit tests for each pattern (positive and negative cases)
+
+**Files Modified:**
+- `src/main.rs`: Linter + tests (~50 lines)
+
+---
+
+#### 0.3 Friendly Ollama Errors & Model Listing ⭐⭐⭐
+**Priority**: HIGH
+**Complexity**: Low
+**Effort**: 0.5 day
+
+**Feature:**
+```bash
+term-ai "install rust"
+Error: Ollama isn't running at http://localhost:11434
+Try: brew services start ollama
+
+term-ai --list-models
+llama3.2
+qwen2.5-coder
+```
+
+**Implementation:**
+- Catch connection-refused errors and print actionable guidance
+- On model-not-found (404), suggest `ollama pull <model>`
+- `--list-models` flag hitting `/api/tags`
+
+**Files Modified:**
+- `src/main.rs`: Error mapping + list-models (~40 lines)
+
+---
+
+#### 0.4 Fix-My-Last-Command (`--fix`) ⭐⭐⭐⭐⭐
+**Priority**: HIGH
+**Complexity**: Medium
+**Effort**: 3-4 days
+
+**Feature:**
+```bash
+$ git pussh origin main
+git: 'pussh' is not a git command.
+
+$ term-ai --fix
+git push origin main
+```
+
+The failed command plus its actual error text is exactly the context local models need to be accurate. Turns term-ai from "a thing I remember to ask" into "a reflex when something breaks".
+
+**Implementation:**
+- `--fix` flag with a dedicated correction prompt
+- Zsh hook to capture the last command and its stderr/exit code
+- Fallback: read last command from shell history, accept error text via stdin
+- Pairs with the safety linter before suggesting fixes
+
+**Files Modified:**
+- `src/main.rs`: Fix mode (~100 lines)
+- `shell-integrations/zsh/`: Capture hook (~50 lines)
+
+---
+
 ### Phase 1: Core UX Improvements
 **Timeline**: 1-2 weeks
 **Goal**: Make the tool more practical and user-friendly
@@ -35,6 +136,7 @@ Transform term-ai from a single-shot command generator into an intelligent, inte
 **Priority**: CRITICAL
 **Complexity**: Low
 **Effort**: 2-3 days
+**Depends on**: 0.2 Safety Linter
 
 **Feature:**
 ```bash
@@ -514,6 +616,10 @@ No personal data is collected.
 
 | Feature | Impact | Complexity | LOC | Effort | Priority | Phase |
 |---------|--------|------------|-----|--------|----------|-------|
+| Streaming Output | ⭐⭐⭐⭐⭐ | Low | 60 | 1d | CRITICAL | 0 |
+| Safety Linter | ⭐⭐⭐⭐⭐ | Low | 50 | 1d | CRITICAL | 0 |
+| Friendly Errors + List Models | ⭐⭐⭐ | Low | 40 | 0.5d | HIGH | 0 |
+| Fix-My-Last-Command | ⭐⭐⭐⭐⭐ | Medium | 150 | 3-4d | HIGH | 0 |
 | Command Execution | ⭐⭐⭐⭐⭐ | Low | 50 | 2-3d | CRITICAL | 1 |
 | Explain Mode | ⭐⭐⭐⭐ | Low | 30 | 1d | HIGH | 1 |
 | Dry-Run Mode | ⭐⭐⭐ | Low | 20 | 1d | MEDIUM | 1 |
@@ -533,11 +639,22 @@ No personal data is collected.
 ## Implementation Priorities
 
 ### Must Have (v0.2.0)
+1. Streaming Output
+2. Safety Linter (prerequisite for `--execute`)
+3. Friendly Ollama Errors & `--list-models`
+4. Fix-My-Last-Command (`--fix`)
+
+**Target**: ~1 week
+**Impact**: Fast, safe, reliable foundation + the killer daily-driver feature
+
+---
+
+### Must Have (v0.3.0)
 1. ✅ Command Execution (`--execute`)
 2. ✅ Explain Mode (`--explain`)
 3. ✅ Interactive Mode (`--interactive`)
 
-**Target**: 2-3 weeks
+**Target**: +2-3 weeks
 **Impact**: Transforms single-use tool → daily driver
 
 ---
@@ -568,6 +685,13 @@ No personal data is collected.
 12. Favorites
 13. Performance Optimization
 14. Telemetry
+
+### Idea Backlog (unscheduled)
+- **Reverse Explain** — explain an arbitrary pasted command (`term-ai explain "tar -xzvf ..."`) before running it
+- **Man-Page Grounding Tool** — a `read_manpage` tool call so the model can check real flags locally, offline, no API key
+- **`--copy` flag** — pipe the generated command to `pbcopy`
+- **OpenAI-Compatible Backends** — abstract the LLM client behind a trait to support LM Studio, llama.cpp server, hosted endpoints
+- **Keyless Search Provider** — DuckDuckGo as a zero-config default so `--websearch` works out of the box
 
 ---
 
@@ -734,10 +858,11 @@ This roadmap is a living document. Contributions and feedback are welcome!
 ## Versioning Strategy
 
 **v0.1.x** - Current state (stable)
-**v0.2.x** - Phase 1 (UX improvements)
-**v0.3.x** - Phase 2 (Interactive experience)
-**v0.4.x** - Phase 3 (Intelligence & context)
-**v0.5.x** - Phase 4 (Advanced integration)
+**v0.2.x** - Phase 0 (Foundations & safety)
+**v0.3.x** - Phase 1 (UX improvements)
+**v0.4.x** - Phase 2 (Interactive experience)
+**v0.5.x** - Phase 3 (Intelligence & context)
+**v0.6.x** - Phase 4 (Advanced integration)
 **v1.0.0** - Production-ready, stable API
 
 ---
@@ -746,15 +871,16 @@ This roadmap is a living document. Contributions and feedback are welcome!
 
 | Phase | Duration | Target Release | Key Features |
 |-------|----------|----------------|--------------|
-| Phase 1 | 1-2 weeks | v0.2.0 (Feb 2026) | Execute, Explain, Dry-run |
-| Phase 2 | 1 week | v0.3.0 (Feb-Mar 2026) | Interactive, History |
-| Phase 3 | 1-2 weeks | v0.4.0 (Mar 2026) | Context, Alternatives |
-| Phase 4 | 2-3 weeks | v0.5.0 (Apr 2026) | Shell integration |
-| Phase 5 | 1-2 weeks | v0.6.0 (May 2026) | Multi-platform, Polish |
-| **v1.0** | **~3 months** | **v1.0.0 (May-Jun 2026)** | **Production ready** |
+| Phase 0 | ~1 week | v0.2.0 (Jul 2026) | Streaming, Safety linter, Friendly errors, Fix mode |
+| Phase 1 | 1-2 weeks | v0.3.0 (Aug 2026) | Execute, Explain, Dry-run |
+| Phase 2 | 1 week | v0.4.0 (Aug 2026) | Interactive, History |
+| Phase 3 | 1-2 weeks | v0.5.0 (Sep 2026) | Context, Alternatives |
+| Phase 4 | 2-3 weeks | v0.6.0 (Oct 2026) | Shell integration |
+| Phase 5 | 1-2 weeks | v0.7.0 (Nov 2026) | Multi-platform, Polish |
+| **v1.0** | **~4 months** | **v1.0.0 (Nov-Dec 2026)** | **Production ready** |
 
 ---
 
-**Last Updated**: January 31, 2026
+**Last Updated**: July 6, 2026
 **Current Version**: v0.1.0
-**Next Milestone**: v0.2.0 (Phase 1)
+**Next Milestone**: v0.2.0 (Phase 0)
