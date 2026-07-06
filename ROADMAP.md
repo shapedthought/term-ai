@@ -882,5 +882,5 @@ This roadmap is a living document. Contributions and feedback are welcome!
 ---
 
 **Last Updated**: July 6, 2026
-**Current Version**: v0.1.0
-**Next Milestone**: v0.2.0 (Phase 0)
+**Current Version**: v0.2.0 (Phase 0 complete)
+**Next Milestone**: v0.3.0 (Phase 1)
