@@ -89,6 +89,15 @@ struct Args {
     /// --history); combine with --execute to run it
     #[arg(long, value_name = "N")]
     replay: Option<usize>,
+
+    /// Start an interactive session that keeps conversation context.
+    /// The PROMPT argument, if given, becomes the first query.
+    #[arg(
+        long,
+        short = 'i',
+        conflicts_with_all = ["fix", "list_models", "history", "history_search", "replay"]
+    )]
+    interactive: bool,
 }
 
 #[derive(Serialize)]
@@ -1006,25 +1015,37 @@ fn create_search_provider(
 }
 
 /// Build initial messages for chat API
-fn build_initial_messages(user_request: &str, explain: bool) -> Vec<Message> {
+/// Build the system message for chat conversations
+fn system_message(explain: bool, websearch: bool) -> Message {
     let current_date = Utc::now().format("%B %d, %Y").to_string();
-    let system_content = format!("You are an expert macOS terminal and development environment engineer.
+    let websearch_note = if websearch {
+        "\n\nWhen you need current information (latest versions, recent releases, current documentation), use the web_search tool to find up-to-date information before responding."
+    } else {
+        ""
+    };
+    let content = format!(
+        "You are an expert macOS terminal and development environment engineer.
 
 Constraints:
 {}
 - Prefer Homebrew for package installation where appropriate.
-- Avoid destructive operations (no rm -rf, no disk formatting, no sudo unless clearly necessary and safe).
+- Avoid destructive operations (no rm -rf, no disk formatting, no sudo unless clearly necessary and safe).{}
 
-When you need current information (latest versions, recent releases, current documentation), use the web_search tool to find up-to-date information before responding.
+Current date: {}",
+        format_rules(explain),
+        websearch_note,
+        current_date
+    );
+    Message {
+        role: "system".to_string(),
+        content,
+        tool_calls: None,
+    }
+}
 
-Current date: {}", format_rules(explain), current_date);
-
+fn build_initial_messages(user_request: &str, explain: bool) -> Vec<Message> {
     vec![
-        Message {
-            role: "system".to_string(),
-            content: system_content,
-            tool_calls: None,
-        },
+        system_message(explain, true),
         Message {
             role: "user".to_string(),
             content: user_request.to_string(),
@@ -1055,6 +1076,76 @@ fn build_tool_definitions() -> Vec<Tool> {
 }
 
 /// Call Ollama's chat API
+/// One NDJSON line of Ollama's streaming /api/chat response
+#[derive(Deserialize)]
+struct ChatStreamChunk {
+    message: Option<Message>,
+    #[serde(default)]
+    done: bool,
+    error: Option<String>,
+}
+
+/// Call Ollama's chat API without tools, streaming each token to `out`.
+/// Returns the full accumulated response.
+fn call_ollama_chat_streaming(
+    messages: &[Message],
+    model: &str,
+    endpoint: &str,
+    out: &mut dyn Write,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let client = Client::new();
+    let url = format!("{}/api/chat", endpoint.trim_end_matches('/'));
+
+    let request_body = ChatRequest {
+        model: model.to_string(),
+        messages: messages.to_vec(),
+        tools: None,
+        stream: true,
+    };
+
+    let response = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .map_err(|e| connection_error(endpoint, e))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().unwrap_or_default();
+        return Err(format_status_error(status, &body, model).into());
+    }
+
+    let reader = BufReader::new(response);
+    let mut full_response = String::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let chunk: ChatStreamChunk = serde_json::from_str(&line)?;
+
+        if let Some(error) = chunk.error {
+            return Err(format!("Ollama error: {}", error).into());
+        }
+
+        if let Some(message) = chunk.message {
+            if !message.content.is_empty() {
+                write!(out, "{}", message.content)?;
+                out.flush()?;
+                full_response.push_str(&message.content);
+            }
+        }
+
+        if chunk.done {
+            break;
+        }
+    }
+
+    Ok(full_response)
+}
+
 fn call_ollama_chat(
     messages: &[Message],
     tools: Option<Vec<Tool>>,
@@ -1110,25 +1201,30 @@ fn execute_tool(
 }
 
 /// Chat with tools - main multi-turn loop
-fn chat_with_tools(
-    user_request: &str,
+/// Search activity collected during a tool loop, for verbose output
+#[derive(Default)]
+struct SearchTrace {
+    queries: Vec<String>,
+    summaries: Vec<String>,
+}
+
+/// Run the chat tool loop until the model stops calling tools, mutating
+/// `messages` in place (the final assistant reply is pushed too, so callers
+/// can keep the conversation going). Returns the final response content.
+fn run_tool_loop(
+    messages: &mut Vec<Message>,
     model: &str,
     endpoint: &str,
     provider: &dyn SearchProvider,
     max_results: usize,
-    verbose: bool,
-    explain: bool,
+    trace: &mut SearchTrace,
+    collect_summaries: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut messages = build_initial_messages(user_request, explain);
     let tools = build_tool_definitions();
     const MAX_ITERATIONS: usize = 10;
 
-    // Track searches for verbose output
-    let mut search_queries: Vec<String> = Vec::new();
-    let mut search_results_summary: Vec<String> = Vec::new();
-
     for _iteration in 0..MAX_ITERATIONS {
-        let response = call_ollama_chat(&messages, Some(tools.clone()), model, endpoint)?;
+        let response = call_ollama_chat(messages, Some(tools.clone()), model, endpoint)?;
 
         // Check if the model made tool calls
         if let Some(tool_calls) = &response.message.tool_calls {
@@ -1138,25 +1234,24 @@ fn chat_with_tools(
 
                 // Execute each tool call
                 for tool_call in tool_calls {
-                    // Track search query for verbose mode
                     if tool_call.function.name == "web_search" {
                         if let Some(query) = tool_call.function.arguments["query"].as_str() {
-                            search_queries.push(query.to_string());
+                            trace.queries.push(query.to_string());
                         }
                     }
 
                     let tool_result = match execute_tool(tool_call, provider, max_results) {
                         Ok(result) => {
-                            // Parse and summarize results for verbose mode
-                            if verbose && tool_call.function.name == "web_search" {
+                            if collect_summaries && tool_call.function.name == "web_search" {
                                 match serde_json::from_str::<Vec<SearchResult>>(&result) {
                                     Ok(results) => {
                                         if results.is_empty() {
-                                            search_results_summary
+                                            trace
+                                                .summaries
                                                 .push("No results found from search".to_string());
                                         } else {
                                             for (i, res) in results.iter().take(3).enumerate() {
-                                                search_results_summary.push(format!(
+                                                trace.summaries.push(format!(
                                                     "{}. {} - {}",
                                                     i + 1,
                                                     res.title,
@@ -1170,8 +1265,7 @@ fn chat_with_tools(
                                         }
                                     }
                                     Err(e) => {
-                                        // Fallback: show that results were returned but couldn't be parsed
-                                        search_results_summary.push(format!(
+                                        trace.summaries.push(format!(
                                             "Search returned results (parse error: {})",
                                             e
                                         ));
@@ -1196,39 +1290,10 @@ fn chat_with_tools(
             }
         }
 
-        // No tool calls, return the final response
-        let final_response = response.message.content;
-
-        if verbose {
-            // Format verbose output
-            let mut output = String::new();
-
-            output.push_str("[Search]\n");
-            output.push_str(&format!("Provider: {}\n", provider.name()));
-            if search_queries.is_empty() {
-                output.push_str("No search required\n");
-            } else {
-                output.push_str(&format!("Searched for: {}\n", search_queries.join(", ")));
-            }
-            output.push('\n');
-
-            output.push_str("[Sources]\n");
-            if search_results_summary.is_empty() {
-                output.push_str("N/A\n");
-            } else {
-                for result in &search_results_summary {
-                    output.push_str(&format!("{}\n", result));
-                }
-            }
-            output.push('\n');
-
-            output.push_str("[Command]\n");
-            output.push_str(&final_response);
-
-            return Ok(output);
-        } else {
-            return Ok(final_response);
-        }
+        // No tool calls: keep the final reply in context and return it
+        let final_response = response.message.content.clone();
+        messages.push(response.message);
+        return Ok(final_response);
     }
 
     Err(format!(
@@ -1236,6 +1301,195 @@ fn chat_with_tools(
         MAX_ITERATIONS
     )
     .into())
+}
+
+fn chat_with_tools(
+    user_request: &str,
+    model: &str,
+    endpoint: &str,
+    provider: &dyn SearchProvider,
+    max_results: usize,
+    verbose: bool,
+    explain: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut messages = build_initial_messages(user_request, explain);
+    let mut trace = SearchTrace::default();
+
+    let final_response = run_tool_loop(
+        &mut messages,
+        model,
+        endpoint,
+        provider,
+        max_results,
+        &mut trace,
+        verbose,
+    )?;
+
+    if !verbose {
+        return Ok(final_response);
+    }
+
+    // Format verbose output
+    let mut output = String::new();
+
+    output.push_str("[Search]\n");
+    output.push_str(&format!("Provider: {}\n", provider.name()));
+    if trace.queries.is_empty() {
+        output.push_str("No search required\n");
+    } else {
+        output.push_str(&format!("Searched for: {}\n", trace.queries.join(", ")));
+    }
+    output.push('\n');
+
+    output.push_str("[Sources]\n");
+    if trace.summaries.is_empty() {
+        output.push_str("N/A\n");
+    } else {
+        for result in &trace.summaries {
+            output.push_str(&format!("{}\n", result));
+        }
+    }
+    output.push('\n');
+
+    output.push_str("[Command]\n");
+    output.push_str(&final_response);
+
+    Ok(output)
+}
+
+/// Interactive REPL: keeps conversation context across queries
+fn run_repl(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let provider: Option<Box<dyn SearchProvider>> = if args.websearch {
+        Some(create_search_provider(args)?)
+    } else {
+        None
+    };
+
+    let mut rl = rustyline::DefaultEditor::new()?;
+    let repl_history_path = state_dir().map(|dir| dir.join("repl_history.txt"));
+    if let Some(path) = &repl_history_path {
+        let _ = rl.load_history(path);
+    }
+
+    eprintln!("term-ai interactive mode — describe what you need, or 'help' for commands.");
+
+    let mut messages = vec![system_message(args.explain, args.websearch)];
+    let mut pending = args.prompt.clone();
+
+    loop {
+        let input = if let Some(first_query) = pending.take() {
+            eprintln!("term-ai> {}", first_query);
+            first_query
+        } else {
+            match rl.readline("term-ai> ") {
+                Ok(line) => line,
+                Err(rustyline::error::ReadlineError::Interrupted) => {
+                    eprintln!("(^C — type 'exit' or press Ctrl-D to quit)");
+                    continue;
+                }
+                Err(rustyline::error::ReadlineError::Eof) => break,
+                Err(e) => return Err(e.into()),
+            }
+        };
+
+        let input = input.trim().to_string();
+        if input.is_empty() {
+            continue;
+        }
+        let _ = rl.add_history_entry(&input);
+
+        match input.as_str() {
+            "exit" | "quit" => break,
+            "clear" => {
+                messages.truncate(1);
+                eprintln!("Context cleared.");
+                continue;
+            }
+            "history" => {
+                let history = load_history();
+                let listing = format_history(&history.history, None, Utc::now());
+                let recent: Vec<&str> = listing.lines().take(10).collect();
+                if recent.is_empty() {
+                    eprintln!("No history yet.");
+                } else {
+                    println!("{}", recent.join("\n"));
+                }
+                continue;
+            }
+            "help" => {
+                eprintln!(
+                    "Commands: exit/quit — leave · clear — reset conversation context · history — recent commands · help — this message.\nAnything else is sent to the model."
+                );
+                continue;
+            }
+            _ => {}
+        }
+
+        messages.push(Message {
+            role: "user".to_string(),
+            content: input.clone(),
+            tool_calls: None,
+        });
+
+        let response = if let Some(provider) = &provider {
+            // Tool calling requires buffered responses
+            let mut trace = SearchTrace::default();
+            run_tool_loop(
+                &mut messages,
+                &args.model,
+                &args.endpoint,
+                provider.as_ref(),
+                args.max_results,
+                &mut trace,
+                false,
+            )
+            .map(|text| {
+                println!("{}", text);
+                text
+            })
+        } else {
+            call_ollama_chat_streaming(&messages, &args.model, &args.endpoint, &mut io::stdout())
+                .map(|text| {
+                    println!();
+                    text
+                })
+        };
+
+        match response {
+            Ok(text) => {
+                if provider.is_none() {
+                    // run_tool_loop keeps context itself; the streaming path
+                    // pushes the assistant reply here
+                    messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: text.clone(),
+                        tool_calls: None,
+                    });
+                }
+                print_safety_warnings(&text);
+                let outcome = handle_execution(&text, args);
+                record_history(
+                    &input,
+                    &executable_portion(&text),
+                    outcome.executed,
+                    outcome.success,
+                );
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                // Drop the failed user turn so it doesn't pollute context
+                messages.pop();
+            }
+        }
+    }
+
+    if let Some(path) = &repl_history_path {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = rl.save_history(path);
+    }
+    Ok(())
 }
 
 fn main() {
@@ -1255,6 +1509,14 @@ fn main() {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
+        }
+        return;
+    }
+
+    if args.interactive {
+        if let Err(e) = run_repl(&args) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
         }
         return;
     }
@@ -1727,6 +1989,49 @@ mod tests {
     }
 
     #[test]
+    fn test_system_message() {
+        let with_search = system_message(false, true);
+        assert_eq!(with_search.role, "system");
+        assert!(with_search.content.contains("web_search tool"));
+
+        let without_search = system_message(false, false);
+        assert!(!without_search.content.contains("web_search tool"));
+
+        let explain = system_message(true, false);
+        assert!(explain.content.contains("Explanation:"));
+    }
+
+    #[test]
+    fn test_chat_stream_chunk_parsing() {
+        let chunk: ChatStreamChunk = serde_json::from_str(
+            r#"{"model":"llama3.1","message":{"role":"assistant","content":"brew "},"done":false}"#,
+        )
+        .unwrap();
+        assert_eq!(chunk.message.unwrap().content, "brew ");
+        assert!(!chunk.done);
+
+        let done: ChatStreamChunk = serde_json::from_str(
+            r#"{"model":"llama3.1","message":{"role":"assistant","content":""},"done":true,"total_duration":9}"#,
+        )
+        .unwrap();
+        assert!(done.done);
+
+        let error: ChatStreamChunk =
+            serde_json::from_str(r#"{"error":"something broke"}"#).unwrap();
+        assert_eq!(error.error.as_deref(), Some("something broke"));
+        assert!(error.message.is_none());
+    }
+
+    #[test]
+    fn test_interactive_flag_conflicts() {
+        assert!(Args::try_parse_from(["term-ai", "-i", "--fix"]).is_err());
+        assert!(Args::try_parse_from(["term-ai", "-i", "--history"]).is_err());
+        assert!(Args::try_parse_from(["term-ai", "-i", "--replay", "1"]).is_err());
+        // Interactive with a seed prompt and websearch is allowed
+        assert!(Args::try_parse_from(["term-ai", "-i", "install docker", "-w"]).is_ok());
+    }
+
+    #[test]
     fn test_parse_last_command_state() {
         let last = parse_last_command_state("1\ngit pussh origin main\n").unwrap();
         assert_eq!(last.command, "git pussh origin main");
@@ -1976,6 +2281,7 @@ mod tests {
             history: false,
             history_search: None,
             replay: None,
+            interactive: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2004,6 +2310,7 @@ mod tests {
             history: false,
             history_search: None,
             replay: None,
+            interactive: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2034,6 +2341,7 @@ mod tests {
             history: false,
             history_search: None,
             replay: None,
+            interactive: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2062,6 +2370,7 @@ mod tests {
             history: false,
             history_search: None,
             replay: None,
+            interactive: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2092,6 +2401,7 @@ mod tests {
             history: false,
             history_search: None,
             replay: None,
+            interactive: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2120,6 +2430,7 @@ mod tests {
             history: false,
             history_search: None,
             replay: None,
+            interactive: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2150,6 +2461,7 @@ mod tests {
             history: false,
             history_search: None,
             replay: None,
+            interactive: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2178,6 +2490,7 @@ mod tests {
             history: false,
             history_search: None,
             replay: None,
+            interactive: false,
         };
 
         let provider = create_search_provider(&args);

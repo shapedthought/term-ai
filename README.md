@@ -92,6 +92,47 @@ term-ai "latest homebrew formulas" -w --model llama3.1
 term-ai "latest homebrew formulas" -w --search-provider serpapi --model llama3.1
 ```
 
+### Interactive Mode (REPL)
+
+Have a conversation — context carries across queries:
+
+```
+$ term-ai -i
+term-ai> install ripgrep
+brew install ripgrep
+
+term-ai> now uninstall it
+brew uninstall ripgrep
+
+term-ai> exit
+```
+
+REPL commands: `exit`/`quit`, `clear` (reset conversation context),
+`history` (recent commands), `help`. Arrow keys and input history work
+(readline); input history persists to `~/.term-ai/repl_history.txt`.
+A prompt argument becomes the first query (`term-ai -i "install docker"`),
+and `--websearch` and `--execute` work per turn.
+
+### Command History
+
+Every generated command is recorded to `~/.term-ai/history.json`:
+
+```bash
+term-ai --history
+1. brew uninstall ripgrep (just now)
+2. brew install docker (2 hours ago) ✓
+
+term-ai --history-search docker
+2. brew install docker (2 hours ago) ✓
+
+term-ai --replay 2        # print entry 2
+term-ai --replay 2 -x     # run it again
+```
+
+`✓`/`✗` mark commands that were executed and their outcome. Numbers are
+stable between `--history` and `--history-search`, so replay always
+targets the right entry.
+
 ### Execute Mode
 
 Run the generated command directly, with a confirmation prompt:
@@ -255,6 +296,20 @@ Options:
 
   --explain
           Include a breakdown of what each part of the command does
+
+  -i, --interactive
+          Start an interactive session that keeps conversation context.
+          The PROMPT argument, if given, becomes the first query
+
+  --history
+          Show recent command history
+
+  --history-search <TERM>
+          Search command history for a term
+
+  --replay <N>
+          Print a command from history by number (1 = most recent);
+          combine with --execute to run it
 
   -h, --help
           Print help
