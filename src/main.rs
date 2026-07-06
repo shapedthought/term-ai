@@ -579,6 +579,7 @@ fn chat_with_tools(
             let mut output = String::new();
 
             output.push_str("[Search]\n");
+            output.push_str(&format!("Provider: {}\n", provider.name()));
             if search_queries.is_empty() {
                 output.push_str("No search required\n");
             } else {
