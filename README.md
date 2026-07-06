@@ -92,6 +92,42 @@ term-ai "latest homebrew formulas" -w --model llama3.1
 term-ai "latest homebrew formulas" -w --search-provider serpapi --model llama3.1
 ```
 
+### Context Awareness
+
+term-ai automatically includes environment context in its prompts — OS,
+shell, working directory, detected project type (with the right package
+manager from lockfiles), git branch/status, and a top-level file listing:
+
+```bash
+# In a Rust repo
+term-ai "run the tests"        # → cargo test
+
+# In a Node repo with pnpm-lock.yaml
+term-ai "install dependencies" # → pnpm install
+```
+
+Disable with `--no-context` if you want environment-independent answers.
+
+### Multiple Suggestions
+
+Get 2-3 approaches instead of one:
+
+```bash
+$ term-ai "create a python virtual environment" -a
+### 1: Using Python's built-in venv module
+python3 -m venv myenv
+
+### 2: Using pyenv
+brew install pyenv
+pyenv virtualenv 3.13 myenv
+
+# With --execute: pick one interactively
+Run which option? [1-2, Enter to skip]: 1
+```
+
+`--yes` auto-selects option 1. Dangerous options still require
+confirmation before running.
+
 ### Interactive Mode (REPL)
 
 Have a conversation — context carries across queries:
@@ -310,6 +346,13 @@ Options:
   --replay <N>
           Print a command from history by number (1 = most recent);
           combine with --execute to run it
+
+  -a, --alternatives
+          Offer 2-3 alternative approaches; with --execute, pick one to run
+
+  --no-context
+          Disable automatic environment context (project type, git status,
+          directory listing) in the prompt
 
   -h, --help
           Print help

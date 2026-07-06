@@ -103,6 +103,10 @@ struct Args {
     /// directory listing) in the prompt
     #[arg(long)]
     no_context: bool,
+
+    /// Offer 2-3 alternative approaches; with --execute, pick one to run
+    #[arg(long, short = 'a', conflicts_with_all = ["explain", "fix"])]
+    alternatives: bool,
 }
 
 #[derive(Serialize)]
@@ -300,7 +304,7 @@ impl SearchProvider for BraveProvider {
 }
 
 /// Build the final prompt with system instructions and user request
-fn build_prompt(user_request: &str, explain: bool, context: Option<&str>) -> String {
+fn build_prompt(user_request: &str, style: OutputStyle, context: Option<&str>) -> String {
     let current_date = Utc::now().format("%B %d, %Y").to_string();
     format!(
         "You are an expert macOS terminal and development environment engineer.
@@ -314,7 +318,7 @@ Current date: {}
 
 User request:
 {}",
-        format_rules(explain),
+        format_rules(style),
         context
             .map(|c| format!("\n{}\n", c))
             .unwrap_or_default(),
@@ -580,15 +584,43 @@ fn gather_context(dir: &std::path::Path) -> String {
     )
 }
 
-/// Output-format rules for the system prompt, depending on explain mode
-fn format_rules(explain: bool) -> &'static str {
-    if explain {
-        "- Start with ONLY the shell command(s), one per line.
+/// How the model should format its response
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum OutputStyle {
+    Plain,
+    Explain,
+    Alternatives,
+}
+
+impl OutputStyle {
+    fn from_args(args: &Args) -> Self {
+        if args.alternatives {
+            OutputStyle::Alternatives
+        } else if args.explain {
+            OutputStyle::Explain
+        } else {
+            OutputStyle::Plain
+        }
+    }
+}
+
+/// Output-format rules for the system prompt
+fn format_rules(style: OutputStyle) -> &'static str {
+    match style {
+        OutputStyle::Plain => {
+            "- Respond ONLY with valid shell commands, one per line.
+- Do not include explanations, comments, Markdown, or prose."
+        }
+        OutputStyle::Explain => {
+            "- Start with ONLY the shell command(s), one per line.
 - After the commands, add a section starting with the exact line \"Explanation:\" containing one bullet per part of the command, in the format \"• <part> : <what it does>\".
 - No other prose or Markdown."
-    } else {
-        "- Respond ONLY with valid shell commands, one per line.
-- Do not include explanations, comments, Markdown, or prose."
+        }
+        OutputStyle::Alternatives => {
+            "- Provide 2-3 distinct alternative approaches.
+- Format each alternative as a header line \"### <number>: <short label>\" followed by its shell command(s), one per line.
+- No other prose, explanations, or Markdown."
+        }
     }
 }
 
@@ -796,6 +828,65 @@ fn executable_portion(text: &str) -> String {
         .to_string()
 }
 
+/// One alternative approach parsed from --alternatives output
+#[derive(Debug, PartialEq)]
+struct Alternative {
+    label: String,
+    command: String,
+}
+
+/// Parse "### <n>: <label>" sections from --alternatives output
+fn parse_alternatives(text: &str) -> Vec<Alternative> {
+    let mut alternatives: Vec<Alternative> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(header) = trimmed.strip_prefix("###") {
+            let label = match header.split_once(':') {
+                Some((_number, label)) => label.trim(),
+                None => header.trim(),
+            };
+            alternatives.push(Alternative {
+                label: label.to_string(),
+                command: String::new(),
+            });
+        } else if let Some(current) = alternatives.last_mut() {
+            if !trimmed.is_empty() && !trimmed.starts_with("```") {
+                if !current.command.is_empty() {
+                    current.command.push('\n');
+                }
+                current.command.push_str(trimmed);
+            }
+        }
+    }
+    alternatives.retain(|a| !a.command.is_empty());
+    alternatives
+}
+
+/// Ask which alternative to run, reading from /dev/tty. Returns the chosen
+/// zero-based index, or None if skipped. --yes picks the first option.
+fn select_alternative(
+    count: usize,
+    auto_yes: bool,
+) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+    if auto_yes {
+        return Ok(Some(0));
+    }
+
+    let tty = std::fs::File::open("/dev/tty").map_err(|_| {
+        "No terminal available for selection. Run interactively, or use --yes to take option 1."
+    })?;
+
+    eprint!("\nRun which option? [1-{}, Enter to skip]: ", count);
+    io::stderr().flush()?;
+
+    let mut answer = String::new();
+    BufReader::new(tty).read_line(&mut answer)?;
+    match answer.trim().parse::<usize>() {
+        Ok(n) if (1..=count).contains(&n) => Ok(Some(n - 1)),
+        _ => Ok(None),
+    }
+}
+
 /// What happened when --execute / --dry-run was handled
 #[derive(Debug, PartialEq)]
 struct ExecutionOutcome {
@@ -813,6 +904,70 @@ impl ExecutionOutcome {
             exit_code: None,
             executed: false,
             success: None,
+        }
+    }
+}
+
+/// Handle --execute for --alternatives output: pick an option, confirm if
+/// dangerous, run it. Returns the outcome and the command chosen (for
+/// history; falls back to the first option when nothing runs).
+fn handle_alternatives_execution(text: &str, args: &Args) -> (ExecutionOutcome, Option<String>) {
+    let alternatives = parse_alternatives(text);
+
+    if alternatives.is_empty() {
+        // Model ignored the format; fall back to the normal path
+        return (handle_execution(text, args), Some(executable_portion(text)));
+    }
+
+    let first = alternatives[0].command.clone();
+
+    if args.dry_run {
+        eprintln!("\n⚠️  Preview only. Add --execute to run.");
+        return (ExecutionOutcome::none(), Some(first));
+    }
+    if !args.execute {
+        return (ExecutionOutcome::none(), Some(first));
+    }
+
+    match select_alternative(alternatives.len(), args.yes) {
+        Ok(Some(index)) => {
+            let chosen = &alternatives[index];
+            eprintln!("Running option {}: {}", index + 1, chosen.label);
+            // An interactive selection is itself confirmation; only
+            // dangerous commands get the extra prompt
+            let dangerous = !lint_commands(&chosen.command).is_empty();
+            let confirmed = if dangerous {
+                confirm_execution(true, args.yes).unwrap_or(false)
+            } else {
+                true
+            };
+            if !confirmed {
+                eprintln!("Skipped.");
+                return (ExecutionOutcome::none(), Some(chosen.command.clone()));
+            }
+            let code = execute_commands(&chosen.command);
+            (
+                ExecutionOutcome {
+                    exit_code: Some(code),
+                    executed: true,
+                    success: Some(code == 0),
+                },
+                Some(chosen.command.clone()),
+            )
+        }
+        Ok(None) => {
+            eprintln!("Skipped.");
+            (ExecutionOutcome::none(), Some(first))
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            (
+                ExecutionOutcome {
+                    exit_code: Some(1),
+                    ..ExecutionOutcome::none()
+                },
+                Some(first),
+            )
         }
     }
 }
@@ -1168,7 +1323,7 @@ fn create_search_provider(
 
 /// Build initial messages for chat API
 /// Build the system message for chat conversations
-fn system_message(explain: bool, websearch: bool, context: Option<&str>) -> Message {
+fn system_message(style: OutputStyle, websearch: bool, context: Option<&str>) -> Message {
     let current_date = Utc::now().format("%B %d, %Y").to_string();
     let websearch_note = if websearch {
         "\n\nWhen you need current information (latest versions, recent releases, current documentation), use the web_search tool to find up-to-date information before responding."
@@ -1184,7 +1339,7 @@ Constraints:
 - Avoid destructive operations (no rm -rf, no disk formatting, no sudo unless clearly necessary and safe).{}
 {}
 Current date: {}",
-        format_rules(explain),
+        format_rules(style),
         websearch_note,
         context
             .map(|c| format!("\n{}\n", c))
@@ -1200,11 +1355,11 @@ Current date: {}",
 
 fn build_initial_messages(
     user_request: &str,
-    explain: bool,
+    style: OutputStyle,
     context: Option<&str>,
 ) -> Vec<Message> {
     vec![
-        system_message(explain, true, context),
+        system_message(style, true, context),
         Message {
             role: "user".to_string(),
             content: user_request.to_string(),
@@ -1470,10 +1625,10 @@ fn chat_with_tools(
     provider: &dyn SearchProvider,
     max_results: usize,
     verbose: bool,
-    explain: bool,
+    style: OutputStyle,
     context: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut messages = build_initial_messages(user_request, explain, context);
+    let mut messages = build_initial_messages(user_request, style, context);
     let mut trace = SearchTrace::default();
 
     let final_response = run_tool_loop(
@@ -1544,7 +1699,7 @@ fn run_repl(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let context = environment_context(args);
     let mut messages = vec![system_message(
-        args.explain,
+        OutputStyle::from_args(args),
         args.websearch,
         context.as_deref(),
     )];
@@ -1641,13 +1796,17 @@ fn run_repl(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
                 print_safety_warnings(&text);
-                let outcome = handle_execution(&text, args);
-                record_history(
-                    &input,
-                    &executable_portion(&text),
-                    outcome.executed,
-                    outcome.success,
-                );
+                let (outcome, history_command) = if args.alternatives {
+                    handle_alternatives_execution(&text, args)
+                } else {
+                    (
+                        handle_execution(&text, args),
+                        Some(executable_portion(&text)),
+                    )
+                };
+                if let Some(command) = history_command {
+                    record_history(&input, &command, outcome.executed, outcome.success);
+                }
             }
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -1810,7 +1969,7 @@ fn main() {
             provider.as_ref(),
             args.max_results,
             args.verbose,
-            args.explain,
+            OutputStyle::from_args(&args),
             environment_context(&args).as_deref(),
         )
         .map(|text| {
@@ -1821,7 +1980,7 @@ fn main() {
         // Default mode - streams tokens to stdout as they arrive
         let final_prompt = build_prompt(
             &user_prompt,
-            args.explain,
+            OutputStyle::from_args(&args),
             environment_context(&args).as_deref(),
         );
         call_ollama(
@@ -1839,13 +1998,17 @@ fn main() {
     match result {
         Ok(text) => {
             print_safety_warnings(&text);
-            let outcome = handle_execution(&text, &args);
-            record_history(
-                &user_prompt,
-                &executable_portion(&text),
-                outcome.executed,
-                outcome.success,
-            );
+            let (outcome, history_command) = if args.alternatives {
+                handle_alternatives_execution(&text, &args)
+            } else {
+                (
+                    handle_execution(&text, &args),
+                    Some(executable_portion(&text)),
+                )
+            };
+            if let Some(command) = history_command {
+                record_history(&user_prompt, &command, outcome.executed, outcome.success);
+            }
             if let Some(code) = outcome.exit_code {
                 std::process::exit(code);
             }
@@ -1864,7 +2027,7 @@ mod tests {
     #[test]
     fn test_build_prompt_includes_system_instructions() {
         let user_request = "install rust";
-        let prompt = build_prompt(user_request, false, None);
+        let prompt = build_prompt(user_request, OutputStyle::Plain, None);
 
         // Verify system prompt is included
         assert!(prompt.contains("You are an expert macOS terminal"));
@@ -1887,8 +2050,8 @@ mod tests {
         let request1 = "setup zsh";
         let request2 = "install node";
 
-        let prompt1 = build_prompt(request1, false, None);
-        let prompt2 = build_prompt(request2, false, None);
+        let prompt1 = build_prompt(request1, OutputStyle::Plain, None);
+        let prompt2 = build_prompt(request2, OutputStyle::Plain, None);
 
         assert!(prompt1.contains(request1));
         assert!(prompt2.contains(request2));
@@ -1899,8 +2062,8 @@ mod tests {
     #[test]
     fn test_build_prompt_consistency() {
         let request = "test request";
-        let prompt1 = build_prompt(request, false, None);
-        let prompt2 = build_prompt(request, false, None);
+        let prompt1 = build_prompt(request, OutputStyle::Plain, None);
+        let prompt2 = build_prompt(request, OutputStyle::Plain, None);
 
         // Same request should produce identical prompts (within same second)
         assert_eq!(prompt1, prompt2);
@@ -1909,7 +2072,7 @@ mod tests {
     #[test]
     fn test_build_prompt_includes_date() {
         let request = "install rust";
-        let prompt = build_prompt(request, false, None);
+        let prompt = build_prompt(request, OutputStyle::Plain, None);
 
         // Verify date is included
         assert!(prompt.contains("Current date:"));
@@ -1936,7 +2099,7 @@ mod tests {
     #[test]
     fn test_build_initial_messages() {
         let user_request = "install rust";
-        let messages = build_initial_messages(user_request, false, None);
+        let messages = build_initial_messages(user_request, OutputStyle::Plain, None);
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
@@ -1949,8 +2112,8 @@ mod tests {
     #[test]
     fn test_build_initial_messages_explain() {
         let user_request = "install rust";
-        let messages_explain = build_initial_messages(user_request, true, None);
-        let messages_normal = build_initial_messages(user_request, false, None);
+        let messages_explain = build_initial_messages(user_request, OutputStyle::Explain, None);
+        let messages_normal = build_initial_messages(user_request, OutputStyle::Plain, None);
 
         assert_eq!(messages_explain.len(), 2);
         assert!(messages_explain[0].content.contains("Explanation:"));
@@ -1960,13 +2123,13 @@ mod tests {
 
     #[test]
     fn test_build_prompt_explain() {
-        let prompt = build_prompt("find large files", true, None);
+        let prompt = build_prompt("find large files", OutputStyle::Explain, None);
         assert!(prompt.contains("Explanation:"));
         assert!(prompt.contains("one bullet per part"));
         // Safety constraint applies in both modes
         assert!(prompt.contains("Avoid destructive operations"));
 
-        let normal = build_prompt("find large files", false, None);
+        let normal = build_prompt("find large files", OutputStyle::Plain, None);
         assert!(normal.contains("Respond ONLY with valid shell commands"));
         assert!(!normal.contains("Explanation:"));
     }
@@ -1982,6 +2145,59 @@ mod tests {
         assert!(lint_commands(command_portion(explained)).is_empty());
         let dangerous = "rm -rf /usr/local/foo\n\nExplanation:\n• harmless text";
         assert_eq!(lint_commands(command_portion(dangerous)).len(), 1);
+    }
+
+    #[test]
+    fn test_parse_alternatives() {
+        let text = "### 1: Standard (venv + pip)\npython3 -m venv venv\nsource venv/bin/activate\n### 2: Modern (uv)\nuv init && uv sync\n";
+        let alternatives = parse_alternatives(text);
+
+        assert_eq!(alternatives.len(), 2);
+        assert_eq!(alternatives[0].label, "Standard (venv + pip)");
+        assert_eq!(
+            alternatives[0].command,
+            "python3 -m venv venv\nsource venv/bin/activate"
+        );
+        assert_eq!(alternatives[1].label, "Modern (uv)");
+        assert_eq!(alternatives[1].command, "uv init && uv sync");
+    }
+
+    #[test]
+    fn test_parse_alternatives_edge_cases() {
+        // Code fences inside sections are ignored
+        let fenced = "### 1: Only option\n```sh\nbrew install jq\n```\n";
+        let alternatives = parse_alternatives(fenced);
+        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives[0].command, "brew install jq");
+
+        // Header without a colon still yields a label
+        let no_colon = "### First\nls -la\n";
+        assert_eq!(parse_alternatives(no_colon)[0].label, "First");
+
+        // Headers with no commands are dropped; plain output yields nothing
+        assert!(parse_alternatives("### 1: Empty\n### 2: Also empty\n").is_empty());
+        assert!(parse_alternatives("brew install jq\n").is_empty());
+    }
+
+    #[test]
+    fn test_output_style() {
+        let plain = Args::try_parse_from(["term-ai", "x"]).unwrap();
+        assert_eq!(OutputStyle::from_args(&plain), OutputStyle::Plain);
+
+        let explain = Args::try_parse_from(["term-ai", "x", "--explain"]).unwrap();
+        assert_eq!(OutputStyle::from_args(&explain), OutputStyle::Explain);
+
+        let alternatives = Args::try_parse_from(["term-ai", "x", "-a"]).unwrap();
+        assert_eq!(
+            OutputStyle::from_args(&alternatives),
+            OutputStyle::Alternatives
+        );
+
+        // Alternatives prompt rules request the ### format
+        assert!(format_rules(OutputStyle::Alternatives).contains("### <number>: <short label>"));
+
+        // --alternatives conflicts with --explain
+        assert!(Args::try_parse_from(["term-ai", "x", "-a", "--explain"]).is_err());
     }
 
     #[test]
@@ -2236,30 +2452,34 @@ mod tests {
     fn test_prompts_include_context() {
         let prompt = build_prompt(
             "run tests",
-            false,
+            OutputStyle::Plain,
             Some("Environment context:\n- OS: macos"),
         );
         assert!(prompt.contains("Environment context:"));
         assert!(prompt.contains("- OS: macos"));
 
-        let msg = system_message(false, false, Some("Environment context:\n- OS: macos"));
+        let msg = system_message(
+            OutputStyle::Plain,
+            false,
+            Some("Environment context:\n- OS: macos"),
+        );
         assert!(msg.content.contains("Environment context:"));
 
         // Without context, no leftover placeholder
-        let bare = build_prompt("run tests", false, None);
+        let bare = build_prompt("run tests", OutputStyle::Plain, None);
         assert!(!bare.contains("Environment context"));
     }
 
     #[test]
     fn test_system_message() {
-        let with_search = system_message(false, true, None);
+        let with_search = system_message(OutputStyle::Plain, true, None);
         assert_eq!(with_search.role, "system");
         assert!(with_search.content.contains("web_search tool"));
 
-        let without_search = system_message(false, false, None);
+        let without_search = system_message(OutputStyle::Plain, false, None);
         assert!(!without_search.content.contains("web_search tool"));
 
-        let explain = system_message(true, false, None);
+        let explain = system_message(OutputStyle::Explain, false, None);
         assert!(explain.content.contains("Explanation:"));
     }
 
@@ -2550,6 +2770,7 @@ mod tests {
             replay: None,
             interactive: false,
             no_context: false,
+            alternatives: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2580,6 +2801,7 @@ mod tests {
             replay: None,
             interactive: false,
             no_context: false,
+            alternatives: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2612,6 +2834,7 @@ mod tests {
             replay: None,
             interactive: false,
             no_context: false,
+            alternatives: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2642,6 +2865,7 @@ mod tests {
             replay: None,
             interactive: false,
             no_context: false,
+            alternatives: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2674,6 +2898,7 @@ mod tests {
             replay: None,
             interactive: false,
             no_context: false,
+            alternatives: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2704,6 +2929,7 @@ mod tests {
             replay: None,
             interactive: false,
             no_context: false,
+            alternatives: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2736,6 +2962,7 @@ mod tests {
             replay: None,
             interactive: false,
             no_context: false,
+            alternatives: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2766,6 +2993,7 @@ mod tests {
             replay: None,
             interactive: false,
             no_context: false,
+            alternatives: false,
         };
 
         let provider = create_search_provider(&args);
