@@ -92,6 +92,49 @@ term-ai "latest homebrew formulas" -w --model llama3.1
 term-ai "latest homebrew formulas" -w --search-provider serpapi --model llama3.1
 ```
 
+### Fix Mode
+
+Suggest a correction for the last failed shell command:
+
+```bash
+$ git pussh origin main
+git: 'pussh' is not a git command.
+
+$ term-ai --fix
+Fixing: git pussh origin main
+git push origin main
+```
+
+For best results, install the zsh integration, which records each command
+and its exit code (in `~/.term-ai/last_command`) so `--fix` knows exactly
+what failed:
+
+```bash
+# Add to ~/.zshrc
+source /path/to/term-ai/shell-integrations/zsh/term-ai.zsh
+```
+
+Without the integration, `--fix` falls back to reading your shell history
+(`~/.zsh_history` or `~/.bash_history`), which may be stale until the shell
+writes it out.
+
+You can also pipe the failing command's output for better accuracy, or pass
+a hint as the prompt argument:
+
+```bash
+make build 2>&1 | term-ai --fix
+term-ai --fix "it said permission denied"
+```
+
+### Listing Models
+
+```bash
+term-ai --list-models
+# llama3.1:latest
+# qwen3:8b
+# gemma3:latest
+```
+
 ## Configuration
 
 ### Environment Variables
@@ -149,6 +192,15 @@ Options:
 
   -v, --verbose
           Show detailed output including search results and reasoning
+
+  --list-models
+          List models available on the Ollama server and exit
+
+  -f, --fix
+          Suggest a fix for the last failed shell command. Reads the command
+          recorded by the zsh integration (falling back to shell history);
+          pipe error output via stdin for better results. The PROMPT argument
+          becomes an extra hint (e.g. the error message you saw)
 
   -h, --help
           Print help

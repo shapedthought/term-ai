@@ -3,7 +3,8 @@ use clap::Parser;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 use urlencoding::encode;
 
@@ -50,6 +51,13 @@ struct Args {
     /// List models available on the Ollama server and exit
     #[arg(long)]
     list_models: bool,
+
+    /// Suggest a fix for the last failed shell command. Reads the command
+    /// recorded by the zsh integration (falling back to shell history);
+    /// pipe error output via stdin for better results. The PROMPT argument
+    /// becomes an extra hint (e.g. the error message you saw).
+    #[arg(long, short = 'f')]
+    fix: bool,
 }
 
 #[derive(Serialize)]
@@ -399,6 +407,114 @@ fn print_safety_warnings(output: &str) {
         }
         eprintln!("Review carefully before running.");
     }
+}
+
+/// The last command a user ran, as recorded by the shell integration
+struct LastCommand {
+    command: String,
+    exit_code: Option<i32>,
+}
+
+/// Path to the state file written by the shell integration
+fn state_file_path() -> Option<PathBuf> {
+    std::env::var_os("TERM_AI_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".term-ai")))
+        .map(|dir| dir.join("last_command"))
+}
+
+/// Parse the state file: exit code on the first line, command on the rest
+fn parse_last_command_state(contents: &str) -> Option<LastCommand> {
+    let (first, rest) = contents.split_once('\n')?;
+    let command = rest.trim().to_string();
+    if command.is_empty() {
+        return None;
+    }
+    Some(LastCommand {
+        command,
+        exit_code: first.trim().parse().ok(),
+    })
+}
+
+/// Extract the command from a shell history line, handling zsh's extended
+/// format (`: <timestamp>:<duration>;<command>`) and plain lines
+fn parse_history_line(line: &str) -> Option<&str> {
+    let command = if line.starts_with(": ") {
+        line.split_once(';')?.1
+    } else {
+        line
+    };
+    let command = command.trim();
+    if command.is_empty() || command.starts_with("term-ai") || command.contains("/term-ai") {
+        return None;
+    }
+    Some(command)
+}
+
+/// Read the most recent command from zsh or bash history as a fallback
+/// when the shell integration isn't installed
+fn read_history_fallback() -> Option<LastCommand> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    for hist in [".zsh_history", ".bash_history"] {
+        let Ok(contents) = std::fs::read_to_string(home.join(hist)) else {
+            continue;
+        };
+        if let Some(command) = contents.lines().rev().find_map(parse_history_line) {
+            return Some(LastCommand {
+                command: command.to_string(),
+                exit_code: None,
+            });
+        }
+    }
+    None
+}
+
+/// Find the last command: shell-integration state file first, history second
+fn read_last_command() -> Option<LastCommand> {
+    if let Some(path) = state_file_path() {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if let Some(last) = parse_last_command_state(&contents) {
+                return Some(last);
+            }
+        }
+    }
+    read_history_fallback()
+}
+
+/// Build the prompt for --fix mode
+fn build_fix_prompt(
+    last: &LastCommand,
+    error_output: Option<&str>,
+    user_hint: Option<&str>,
+) -> String {
+    let current_date = Utc::now().format("%B %d, %Y").to_string();
+    let mut prompt = format!(
+        "You are an expert macOS terminal and development environment engineer.
+A shell command failed. Suggest the corrected command.
+
+Constraints:
+- Respond ONLY with the corrected shell command(s), one per line.
+- Do not include explanations, comments, Markdown, or prose.
+- Make the smallest change that fixes the problem (e.g. fix typos, wrong flags, missing arguments).
+- Avoid destructive operations (no rm -rf, no disk formatting, no sudo unless clearly necessary and safe).
+
+Current date: {}
+
+Failed command:
+{}",
+        current_date, last.command
+    );
+
+    if let Some(code) = last.exit_code {
+        prompt.push_str(&format!("\n\nExit code: {}", code));
+    }
+    if let Some(error) = error_output {
+        prompt.push_str(&format!("\n\nError output:\n{}", error));
+    }
+    if let Some(hint) = user_hint {
+        prompt.push_str(&format!("\n\nAdditional context from the user:\n{}", hint));
+    }
+    prompt
 }
 
 /// Map a request error to actionable guidance when Ollama is unreachable
@@ -844,6 +960,42 @@ fn main() {
         return;
     }
 
+    if args.fix {
+        // When stdin is piped, treat it as the failed command's error output
+        let error_output = if io::stdin().is_terminal() {
+            None
+        } else {
+            let mut buffer = String::new();
+            io::stdin().read_to_string(&mut buffer).ok();
+            let trimmed = buffer.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        };
+
+        let Some(last) = read_last_command() else {
+            eprintln!(
+                "Error: No previous command found.\n\
+                 For best results, install the zsh integration:\n\
+                   source /path/to/term-ai/shell-integrations/zsh/term-ai.zsh\n\
+                 (added to your ~/.zshrc), or pipe the failing command's output:\n\
+                   <command> 2>&1 | term-ai --fix"
+            );
+            std::process::exit(1);
+        };
+
+        eprintln!("Fixing: {}", last.command);
+        let prompt = build_fix_prompt(&last, error_output.as_deref(), args.prompt.as_deref());
+        let result =
+            call_ollama(&prompt, &args.model, &args.endpoint, &mut io::stdout()).map(|text| {
+                println!();
+                print_safety_warnings(&text);
+            });
+        if let Err(e) = result {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Get the user prompt
     let user_prompt = match get_user_prompt(args.prompt.clone()) {
         Ok(prompt) => prompt,
@@ -1012,6 +1164,76 @@ mod tests {
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["query"].is_object());
         assert_eq!(params["required"][0], "query");
+    }
+
+    #[test]
+    fn test_parse_last_command_state() {
+        let last = parse_last_command_state("1\ngit pussh origin main\n").unwrap();
+        assert_eq!(last.command, "git pussh origin main");
+        assert_eq!(last.exit_code, Some(1));
+
+        // Multi-line command
+        let last = parse_last_command_state("127\nfor f in *.txt; do\n  cat $f\ndone").unwrap();
+        assert!(last.command.starts_with("for f in *.txt"));
+        assert!(last.command.ends_with("done"));
+        assert_eq!(last.exit_code, Some(127));
+
+        // Unparseable exit code still yields the command
+        let last = parse_last_command_state("?\nls -la\n").unwrap();
+        assert_eq!(last.command, "ls -la");
+        assert_eq!(last.exit_code, None);
+
+        assert!(parse_last_command_state("").is_none());
+        assert!(parse_last_command_state("1\n\n").is_none());
+    }
+
+    #[test]
+    fn test_parse_history_line() {
+        // zsh extended format
+        assert_eq!(
+            parse_history_line(": 1751830000:0;git pussh origin main"),
+            Some("git pussh origin main")
+        );
+        // plain format (bash, or zsh without EXTENDED_HISTORY)
+        assert_eq!(
+            parse_history_line("brew install jq"),
+            Some("brew install jq")
+        );
+        // term-ai invocations are skipped
+        assert!(parse_history_line("term-ai --fix").is_none());
+        assert!(parse_history_line(": 1751830000:0;term-ai \"install jq\"").is_none());
+        assert!(parse_history_line("./target/release/term-ai --fix").is_none());
+        assert!(parse_history_line("").is_none());
+    }
+
+    #[test]
+    fn test_build_fix_prompt() {
+        let last = LastCommand {
+            command: "git pussh origin main".to_string(),
+            exit_code: Some(1),
+        };
+        let prompt = build_fix_prompt(&last, Some("git: 'pussh' is not a git command."), None);
+
+        assert!(prompt.contains("A shell command failed"));
+        assert!(prompt.contains("git pussh origin main"));
+        assert!(prompt.contains("Exit code: 1"));
+        assert!(prompt.contains("'pussh' is not a git command"));
+        assert!(prompt.contains("Respond ONLY with the corrected shell command"));
+        assert!(prompt.contains("Avoid destructive operations"));
+    }
+
+    #[test]
+    fn test_build_fix_prompt_minimal_and_hint() {
+        let last = LastCommand {
+            command: "ls -z".to_string(),
+            exit_code: None,
+        };
+        let prompt = build_fix_prompt(&last, None, Some("I wanted human-readable sizes"));
+
+        assert!(prompt.contains("ls -z"));
+        assert!(!prompt.contains("Exit code:"));
+        assert!(!prompt.contains("Error output:"));
+        assert!(prompt.contains("I wanted human-readable sizes"));
     }
 
     #[test]
@@ -1186,6 +1408,7 @@ mod tests {
             max_results: 5,
             verbose: false,
             list_models: false,
+            fix: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1206,6 +1429,7 @@ mod tests {
             max_results: 5,
             verbose: false,
             list_models: false,
+            fix: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1228,6 +1452,7 @@ mod tests {
             max_results: 5,
             verbose: false,
             list_models: false,
+            fix: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1248,6 +1473,7 @@ mod tests {
             max_results: 5,
             verbose: false,
             list_models: false,
+            fix: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1270,6 +1496,7 @@ mod tests {
             max_results: 5,
             verbose: false,
             list_models: false,
+            fix: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1290,6 +1517,7 @@ mod tests {
             max_results: 5,
             verbose: false,
             list_models: false,
+            fix: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1312,6 +1540,7 @@ mod tests {
             max_results: 5,
             verbose: false,
             list_models: false,
+            fix: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1332,6 +1561,7 @@ mod tests {
             max_results: 5,
             verbose: false,
             list_models: false,
+            fix: false,
         };
 
         let provider = create_search_provider(&args);
