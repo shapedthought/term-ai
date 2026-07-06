@@ -263,6 +263,140 @@ User request:
     )
 }
 
+/// Check a single command line against deny-patterns for destructive
+/// operations. Returns a description of the danger if one matches.
+fn check_dangerous_line(line: &str) -> Option<&'static str> {
+    let lower = line.to_lowercase();
+    let compact: String = lower.split_whitespace().collect();
+
+    // Fork bomb
+    if compact.contains(":(){") || compact.contains(":|:&") {
+        return Some("fork bomb — will exhaust system resources");
+    }
+
+    // dd writing to a raw device
+    if lower
+        .split_whitespace()
+        .any(|t| t == "dd" || t.ends_with("/dd"))
+        && lower.contains("of=/dev/")
+    {
+        return Some("writes directly to a raw device — can destroy disks");
+    }
+
+    // Filesystem formatting
+    if lower
+        .split_whitespace()
+        .any(|t| t.starts_with("mkfs") || t.ends_with("/mkfs") || t.contains("/mkfs."))
+        || lower.contains("diskutil erase")
+    {
+        return Some("formats a filesystem — destroys all data on it");
+    }
+
+    // Redirecting output onto a block device
+    if compact.contains(">/dev/sd")
+        || compact.contains(">/dev/disk")
+        || compact.contains(">/dev/rdisk")
+    {
+        return Some("overwrites a raw device — can destroy disks");
+    }
+
+    // Piping a remote script straight into a shell
+    if (lower.contains("curl") || lower.contains("wget")) && {
+        let after_pipe = lower.rsplit('|').next().unwrap_or("");
+        matches!(
+            after_pipe.split_whitespace().next(),
+            Some("sh") | Some("bash") | Some("zsh") | Some("sudo")
+        )
+    } {
+        return Some("pipes a remote script into a shell — runs unreviewed code");
+    }
+
+    // Shell executing a remote script via command substitution, e.g. bash -c "$(curl ...)"
+    if (compact.contains("sh-c") || compact.contains("bash-c") || compact.contains("zsh-c"))
+        && (compact.contains("$(curl") || compact.contains("$(wget"))
+    {
+        return Some("executes a remote script in a shell — runs unreviewed code");
+    }
+
+    // World-writable recursive chmod
+    if lower.contains("chmod")
+        && lower.contains("777")
+        && lower
+            .split_whitespace()
+            .any(|t| t == "-r" || (t.starts_with('-') && t.contains('R')))
+    {
+        return Some("makes files world-writable recursively");
+    }
+
+    // Recursive force-delete of a critical path
+    if is_dangerous_rm(line) {
+        return Some("recursive force-delete of a critical path");
+    }
+
+    None
+}
+
+/// Detect `rm` with both recursive and force flags targeting the root
+/// filesystem, home directory, or a bare wildcard.
+fn is_dangerous_rm(line: &str) -> bool {
+    for segment in line.split(&['|', ';', '&'][..]) {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        let Some(rm_pos) = tokens.iter().position(|t| *t == "rm" || t.ends_with("/rm")) else {
+            continue;
+        };
+
+        let args = &tokens[rm_pos + 1..];
+        let recursive = args.iter().any(|a| {
+            *a == "--recursive"
+                || (a.starts_with('-') && !a.starts_with("--") && a.to_lowercase().contains('r'))
+        });
+        let force = args.iter().any(|a| {
+            *a == "--force" || (a.starts_with('-') && !a.starts_with("--") && a.contains('f'))
+        });
+        if !(recursive && force) {
+            continue;
+        }
+
+        let critical_prefixes = [
+            "/System", "/usr", "/etc", "/var", "/bin", "/sbin", "/Library", "/dev",
+        ];
+        for target in args.iter().filter(|a| !a.starts_with('-')) {
+            let dangerous = matches!(
+                *target,
+                "/" | "/*" | "~" | "~/" | "~/*" | "$HOME" | "\"$HOME\"" | "$HOME/*" | "*" | ".*"
+            ) || critical_prefixes.iter().any(|p| {
+                target.trim_end_matches('/') == *p || target.starts_with(&format!("{}/", p))
+            });
+            if dangerous {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Lint generated output and return a warning per dangerous line
+fn lint_commands(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            check_dangerous_line(line).map(|reason| format!("{} — {}", line.trim(), reason))
+        })
+        .collect()
+}
+
+/// Print safety warnings for dangerous commands to stderr
+fn print_safety_warnings(output: &str) {
+    let warnings = lint_commands(output);
+    if !warnings.is_empty() {
+        eprintln!();
+        for warning in warnings {
+            eprintln!("⚠️  DANGEROUS: {}", warning);
+        }
+        eprintln!("Review carefully before running.");
+    }
+}
+
 /// Call the Ollama API, streaming each token to `out` as it arrives.
 /// Returns the full accumulated response.
 fn call_ollama(
@@ -644,7 +778,10 @@ fn main() {
             args.max_results,
             args.verbose,
         )
-        .map(|text| println!("{}", text))
+        .map(|text| {
+            println!("{}", text);
+            print_safety_warnings(&text);
+        })
     } else {
         // Default mode - streams tokens to stdout as they arrive
         let final_prompt = build_prompt(&user_prompt);
@@ -654,7 +791,10 @@ fn main() {
             &args.endpoint,
             &mut io::stdout(),
         )
-        .map(|_| println!())
+        .map(|text| {
+            println!();
+            print_safety_warnings(&text);
+        })
     };
 
     if let Err(e) = result {
@@ -778,6 +918,79 @@ mod tests {
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["query"].is_object());
         assert_eq!(params["required"][0], "query");
+    }
+
+    #[test]
+    fn test_linter_flags_dangerous_rm() {
+        assert!(check_dangerous_line("rm -rf /").is_some());
+        assert!(check_dangerous_line("rm -rf ~").is_some());
+        assert!(check_dangerous_line("rm -rf $HOME").is_some());
+        assert!(check_dangerous_line("rm -rf /usr/local").is_some());
+        assert!(check_dangerous_line("sudo rm -fr /etc").is_some());
+        assert!(check_dangerous_line("rm -r -f /var/log").is_some());
+        assert!(check_dangerous_line("/bin/rm -rf /System").is_some());
+        assert!(check_dangerous_line("cd /tmp && rm -rf *").is_some());
+    }
+
+    #[test]
+    fn test_linter_allows_safe_rm() {
+        assert!(check_dangerous_line("rm file.txt").is_none());
+        assert!(check_dangerous_line("rm -rf ./build").is_none());
+        assert!(check_dangerous_line("rm -rf node_modules").is_none());
+        assert!(check_dangerous_line("rm -r docs/old").is_none());
+    }
+
+    #[test]
+    fn test_linter_flags_device_writes() {
+        assert!(check_dangerous_line("dd if=image.iso of=/dev/disk2 bs=1m").is_some());
+        assert!(check_dangerous_line("cat image.iso > /dev/sda").is_some());
+        assert!(check_dangerous_line("mkfs.ext4 /dev/sdb1").is_some());
+        assert!(check_dangerous_line("diskutil eraseDisk APFS Blank /dev/disk2").is_some());
+    }
+
+    #[test]
+    fn test_linter_allows_safe_dd_and_redirects() {
+        assert!(check_dangerous_line("dd if=/dev/urandom of=random.bin bs=1k count=1").is_none());
+        assert!(check_dangerous_line("echo test > /dev/null").is_none());
+    }
+
+    #[test]
+    fn test_linter_flags_curl_pipe_shell() {
+        assert!(check_dangerous_line("curl -fsSL https://example.com/install.sh | sh").is_some());
+        assert!(check_dangerous_line("curl https://example.com/x.sh | sudo bash").is_some());
+        assert!(check_dangerous_line("wget -qO- https://example.com/i.sh | bash").is_some());
+        assert!(check_dangerous_line(
+            "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn test_linter_allows_plain_curl() {
+        assert!(check_dangerous_line("curl -O https://example.com/file.tar.gz").is_none());
+        assert!(check_dangerous_line("curl -s https://api.example.com | jq '.name'").is_none());
+    }
+
+    #[test]
+    fn test_linter_flags_chmod_777_and_fork_bomb() {
+        assert!(check_dangerous_line("chmod -R 777 /var/www").is_some());
+        assert!(check_dangerous_line(":(){ :|:& };:").is_some());
+    }
+
+    #[test]
+    fn test_linter_allows_normal_chmod() {
+        assert!(check_dangerous_line("chmod 755 script.sh").is_none());
+        assert!(check_dangerous_line("chmod -R 644 docs/").is_none());
+    }
+
+    #[test]
+    fn test_lint_commands_multiline() {
+        let output = "brew install jq\nrm -rf /usr/local/foo\necho done";
+        let warnings = lint_commands(output);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("rm -rf /usr/local/foo"));
+
+        assert!(lint_commands("brew install jq\nls -la").is_empty());
     }
 
     #[test]
