@@ -46,6 +46,10 @@ struct Args {
     /// Show detailed output including search results and reasoning
     #[arg(long, short = 'v')]
     verbose: bool,
+
+    /// List models available on the Ollama server and exit
+    #[arg(long)]
+    list_models: bool,
 }
 
 #[derive(Serialize)]
@@ -397,6 +401,70 @@ fn print_safety_warnings(output: &str) {
     }
 }
 
+/// Map a request error to actionable guidance when Ollama is unreachable
+fn connection_error(endpoint: &str, e: reqwest::Error) -> Box<dyn std::error::Error> {
+    if e.is_connect() {
+        format!(
+            "Ollama isn't running at {}\nTry: brew services start ollama (or: ollama serve)",
+            endpoint
+        )
+        .into()
+    } else if e.is_timeout() {
+        format!("Ollama at {} timed out — is it overloaded?", endpoint).into()
+    } else {
+        e.into()
+    }
+}
+
+/// Turn a non-success Ollama status + body into an actionable error message
+fn format_status_error(status: u16, body: &str, model: &str) -> String {
+    // Ollama error bodies look like {"error":"model 'x' not found, try pulling it first"}
+    let detail = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"].as_str().map(String::from))
+        .unwrap_or_else(|| body.trim().to_string());
+
+    if status == 404 && detail.contains("not found") {
+        format!(
+            "Model '{}' is not available on the Ollama server ({})\nTry: ollama pull {}\nOr list what's installed with: term-ai --list-models",
+            model, detail, model
+        )
+    } else if detail.is_empty() {
+        format!("Ollama returned status: {}", status)
+    } else {
+        format!("Ollama returned status {}: {}", status, detail)
+    }
+}
+
+/// Parse model names out of Ollama's /api/tags response
+fn parse_model_names(body: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let json: serde_json::Value = serde_json::from_str(body)?;
+    let models = json["models"]
+        .as_array()
+        .ok_or("Unexpected response from Ollama: missing 'models' array")?
+        .iter()
+        .filter_map(|m| m["name"].as_str().map(String::from))
+        .collect();
+    Ok(models)
+}
+
+/// Fetch the models installed on the Ollama server
+fn list_models(endpoint: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let url = format!("{}/api/tags", endpoint.trim_end_matches('/'));
+
+    let response = client
+        .get(&url)
+        .send()
+        .map_err(|e| connection_error(endpoint, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Ollama returned status: {}", response.status()).into());
+    }
+
+    parse_model_names(&response.text()?)
+}
+
 /// Call the Ollama API, streaming each token to `out` as it arrives.
 /// Returns the full accumulated response.
 fn call_ollama(
@@ -414,10 +482,16 @@ fn call_ollama(
         stream: true,
     };
 
-    let response = client.post(&url).json(&request_body).send()?;
+    let response = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .map_err(|e| connection_error(endpoint, e))?;
 
     if !response.status().is_success() {
-        return Err(format!("Ollama returned status: {}", response.status()).into());
+        let status = response.status().as_u16();
+        let body = response.text().unwrap_or_default();
+        return Err(format_status_error(status, &body, model).into());
     }
 
     let reader = BufReader::new(response);
@@ -584,14 +658,16 @@ fn call_ollama_chat(
         stream: false,
     };
 
-    let response = client.post(&url).json(&request_body).send()?;
+    let response = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .map_err(|e| connection_error(endpoint, e))?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(format!("Ollama returned status {}: {}", status, error_text).into());
+        let status = response.status().as_u16();
+        let body = response.text().unwrap_or_default();
+        return Err(format_status_error(status, &body, model).into());
     }
 
     let chat_response: ChatResponse = response.json()?;
@@ -749,6 +825,24 @@ fn chat_with_tools(
 
 fn main() {
     let args = Args::parse();
+
+    if args.list_models {
+        match list_models(&args.endpoint) {
+            Ok(models) if models.is_empty() => {
+                println!("No models installed. Pull one with: ollama pull llama3.2");
+            }
+            Ok(models) => {
+                for model in models {
+                    println!("{}", model);
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     // Get the user prompt
     let user_prompt = match get_user_prompt(args.prompt.clone()) {
@@ -921,6 +1015,48 @@ mod tests {
     }
 
     #[test]
+    fn test_format_status_error_model_not_found() {
+        let msg = format_status_error(
+            404,
+            r#"{"error":"model 'llama3.2' not found, try pulling it first"}"#,
+            "llama3.2",
+        );
+        assert!(msg.contains("Model 'llama3.2' is not available"));
+        assert!(msg.contains("ollama pull llama3.2"));
+        assert!(msg.contains("--list-models"));
+    }
+
+    #[test]
+    fn test_format_status_error_other_status() {
+        let msg = format_status_error(500, r#"{"error":"something broke"}"#, "llama3.2");
+        assert!(msg.contains("500"));
+        assert!(msg.contains("something broke"));
+        assert!(!msg.contains("ollama pull"));
+    }
+
+    #[test]
+    fn test_format_status_error_unparseable_body() {
+        let msg = format_status_error(502, "Bad Gateway", "llama3.2");
+        assert!(msg.contains("502"));
+        assert!(msg.contains("Bad Gateway"));
+
+        let msg = format_status_error(503, "", "llama3.2");
+        assert!(msg.contains("503"));
+    }
+
+    #[test]
+    fn test_parse_model_names() {
+        let body = r#"{"models":[{"name":"llama3.2","size":123},{"name":"qwen3:8b","size":456}]}"#;
+        let names = parse_model_names(body).unwrap();
+        assert_eq!(names, vec!["llama3.2", "qwen3:8b"]);
+
+        let empty = parse_model_names(r#"{"models":[]}"#).unwrap();
+        assert!(empty.is_empty());
+
+        assert!(parse_model_names(r#"{"unexpected":true}"#).is_err());
+    }
+
+    #[test]
     fn test_linter_flags_dangerous_rm() {
         assert!(check_dangerous_line("rm -rf /").is_some());
         assert!(check_dangerous_line("rm -rf ~").is_some());
@@ -1049,6 +1185,7 @@ mod tests {
             serpapi_key: Some("test-key".to_string()),
             max_results: 5,
             verbose: false,
+            list_models: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1068,6 +1205,7 @@ mod tests {
             serpapi_key: None,
             max_results: 5,
             verbose: false,
+            list_models: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1089,6 +1227,7 @@ mod tests {
             serpapi_key: Some("test-key".to_string()),
             max_results: 5,
             verbose: false,
+            list_models: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1108,6 +1247,7 @@ mod tests {
             serpapi_key: None,
             max_results: 5,
             verbose: false,
+            list_models: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1129,6 +1269,7 @@ mod tests {
             serpapi_key: None,
             max_results: 5,
             verbose: false,
+            list_models: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1148,6 +1289,7 @@ mod tests {
             serpapi_key: None,
             max_results: 5,
             verbose: false,
+            list_models: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1169,6 +1311,7 @@ mod tests {
             serpapi_key: None,
             max_results: 5,
             verbose: false,
+            list_models: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1188,6 +1331,7 @@ mod tests {
             serpapi_key: None,
             max_results: 5,
             verbose: false,
+            list_models: false,
         };
 
         let provider = create_search_provider(&args);
