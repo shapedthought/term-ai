@@ -76,6 +76,19 @@ struct Args {
     /// (no short form: -e is taken by --endpoint)
     #[arg(long, conflicts_with = "execute")]
     explain: bool,
+
+    /// Show recent command history
+    #[arg(long)]
+    history: bool,
+
+    /// Search command history for a term
+    #[arg(long, value_name = "TERM")]
+    history_search: Option<String>,
+
+    /// Print a command from history by number (1 = most recent, see
+    /// --history); combine with --execute to run it
+    #[arg(long, value_name = "N")]
+    replay: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -291,6 +304,123 @@ User request:
         current_date,
         user_request
     )
+}
+
+// --- Command history ---
+
+const HISTORY_LIMIT: usize = 500;
+
+#[derive(Serialize, Deserialize, Clone)]
+struct HistoryEntry {
+    timestamp: String,
+    query: String,
+    command: String,
+    executed: bool,
+    success: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct History {
+    history: Vec<HistoryEntry>,
+}
+
+fn history_path() -> Option<PathBuf> {
+    state_dir().map(|dir| dir.join("history.json"))
+}
+
+fn load_history() -> History {
+    history_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
+}
+
+/// Append an entry to the history file. Best-effort: failures are silent
+/// so history can never break command generation.
+fn record_history(query: &str, command: &str, executed: bool, success: Option<bool>) {
+    let command = command.trim();
+    if command.is_empty() {
+        return;
+    }
+    let Some(path) = history_path() else {
+        return;
+    };
+    let mut history = load_history();
+    history.history.push(HistoryEntry {
+        timestamp: Utc::now().to_rfc3339(),
+        query: query.to_string(),
+        command: command.to_string(),
+        executed,
+        success,
+    });
+    let len = history.history.len();
+    if len > HISTORY_LIMIT {
+        history.history.drain(..len - HISTORY_LIMIT);
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&history) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Human-friendly relative time for history listings
+fn relative_time(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = (now - then).num_seconds().max(0);
+    match seconds {
+        0..=59 => "just now".to_string(),
+        60..=3599 => {
+            let m = seconds / 60;
+            format!("{} minute{} ago", m, if m == 1 { "" } else { "s" })
+        }
+        3600..=86399 => {
+            let h = seconds / 3600;
+            format!("{} hour{} ago", h, if h == 1 { "" } else { "s" })
+        }
+        86400..=172799 => "yesterday".to_string(),
+        _ => {
+            let d = seconds / 86400;
+            format!("{} days ago", d)
+        }
+    }
+}
+
+/// Format history entries newest-first with stable numbers, so the numbers
+/// shown by a filtered search still work with --replay
+fn format_history(entries: &[HistoryEntry], filter: Option<&str>, now: DateTime<Utc>) -> String {
+    let filter_lower = filter.map(str::to_lowercase);
+    let mut lines = Vec::new();
+    for (i, entry) in entries.iter().rev().enumerate() {
+        if let Some(f) = &filter_lower {
+            if !entry.command.to_lowercase().contains(f) && !entry.query.to_lowercase().contains(f)
+            {
+                continue;
+            }
+        }
+        let when = DateTime::parse_from_rfc3339(&entry.timestamp)
+            .map(|t| relative_time(t.with_timezone(&Utc), now))
+            .unwrap_or_else(|_| "unknown time".to_string());
+        let marker = match (entry.executed, entry.success) {
+            (true, Some(true)) => " ✓",
+            (true, Some(false)) => " ✗",
+            _ => "",
+        };
+        lines.push(format!("{}. {} ({}){}", i + 1, entry.command, when, marker));
+    }
+    lines.join("\n")
+}
+
+/// Look up a history entry by its --history number (1 = most recent)
+fn history_entry_by_number(history: &History, number: usize) -> Option<&HistoryEntry> {
+    if number == 0 {
+        return None;
+    }
+    let len = history.history.len();
+    if number > len {
+        return None;
+    }
+    history.history.get(len - number)
 }
 
 /// Output-format rules for the system prompt, depending on explain mode
@@ -509,35 +639,68 @@ fn executable_portion(text: &str) -> String {
         .to_string()
 }
 
-/// Handle --execute / --dry-run for generated output. Returns an exit code
-/// to terminate with, or None to continue normally.
-fn handle_execution(text: &str, args: &Args) -> Option<i32> {
+/// What happened when --execute / --dry-run was handled
+#[derive(Debug, PartialEq)]
+struct ExecutionOutcome {
+    /// Exit code to terminate with, if the run should end now
+    exit_code: Option<i32>,
+    /// Whether the command was actually executed
+    executed: bool,
+    /// If executed, whether it succeeded
+    success: Option<bool>,
+}
+
+impl ExecutionOutcome {
+    fn none() -> Self {
+        ExecutionOutcome {
+            exit_code: None,
+            executed: false,
+            success: None,
+        }
+    }
+}
+
+/// Handle --execute / --dry-run for generated output
+fn handle_execution(text: &str, args: &Args) -> ExecutionOutcome {
     let commands = executable_portion(text);
 
     if args.dry_run {
         eprintln!("\n⚠️  Preview only. Add --execute to run.");
-        return None;
+        return ExecutionOutcome::none();
     }
 
     if !args.execute {
-        return None;
+        return ExecutionOutcome::none();
     }
 
     if commands.is_empty() {
         eprintln!("Nothing to execute.");
-        return Some(1);
+        return ExecutionOutcome {
+            exit_code: Some(1),
+            ..ExecutionOutcome::none()
+        };
     }
 
     let dangerous = !lint_commands(&commands).is_empty();
     match confirm_execution(dangerous, args.yes) {
-        Ok(true) => Some(execute_commands(&commands)),
+        Ok(true) => {
+            let code = execute_commands(&commands);
+            ExecutionOutcome {
+                exit_code: Some(code),
+                executed: true,
+                success: Some(code == 0),
+            }
+        }
         Ok(false) => {
             eprintln!("Skipped.");
-            None
+            ExecutionOutcome::none()
         }
         Err(e) => {
             eprintln!("Error: {}", e);
-            Some(1)
+            ExecutionOutcome {
+                exit_code: Some(1),
+                ..ExecutionOutcome::none()
+            }
         }
     }
 }
@@ -548,12 +711,16 @@ struct LastCommand {
     exit_code: Option<i32>,
 }
 
-/// Path to the state file written by the shell integration
-fn state_file_path() -> Option<PathBuf> {
+/// Directory for term-ai state (shell-integration capture, history)
+fn state_dir() -> Option<PathBuf> {
     std::env::var_os("TERM_AI_STATE_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".term-ai")))
-        .map(|dir| dir.join("last_command"))
+}
+
+/// Path to the state file written by the shell integration
+fn state_file_path() -> Option<PathBuf> {
+    state_dir().map(|dir| dir.join("last_command"))
 }
 
 /// Parse the state file: exit code on the first line, command on the rest
@@ -1092,6 +1259,41 @@ fn main() {
         return;
     }
 
+    if args.history || args.history_search.is_some() {
+        let history = load_history();
+        if history.history.is_empty() {
+            println!("No history yet.");
+            return;
+        }
+        let listing = format_history(&history.history, args.history_search.as_deref(), Utc::now());
+        if listing.is_empty() {
+            println!("No matching history entries.");
+        } else {
+            println!("{}", listing);
+        }
+        return;
+    }
+
+    if let Some(number) = args.replay {
+        let history = load_history();
+        let Some(entry) = history_entry_by_number(&history, number) else {
+            eprintln!(
+                "Error: no history entry #{} ({} entries — see --history)",
+                number,
+                history.history.len()
+            );
+            std::process::exit(1);
+        };
+        let command = entry.command.clone();
+        println!("{}", command);
+        print_safety_warnings(&command);
+        let outcome = handle_execution(&command, &args);
+        if let Some(code) = outcome.exit_code {
+            std::process::exit(code);
+        }
+        return;
+    }
+
     if args.fix {
         // When stdin is piped, treat it as the failed command's error output
         let error_output = if io::stdin().is_terminal() {
@@ -1120,7 +1322,14 @@ fn main() {
             Ok(text) => {
                 println!();
                 print_safety_warnings(&text);
-                if let Some(code) = handle_execution(&text, &args) {
+                let outcome = handle_execution(&text, &args);
+                record_history(
+                    &format!("fix: {}", last.command),
+                    &executable_portion(&text),
+                    outcome.executed,
+                    outcome.success,
+                );
+                if let Some(code) = outcome.exit_code {
                     std::process::exit(code);
                 }
             }
@@ -1183,7 +1392,14 @@ fn main() {
     match result {
         Ok(text) => {
             print_safety_warnings(&text);
-            if let Some(code) = handle_execution(&text, &args) {
+            let outcome = handle_execution(&text, &args);
+            record_history(
+                &user_prompt,
+                &executable_portion(&text),
+                outcome.executed,
+                outcome.success,
+            );
+            if let Some(code) = outcome.exit_code {
                 std::process::exit(code);
             }
         }
@@ -1376,22 +1592,138 @@ mod tests {
         let mut args = Args::try_parse_from(["term-ai", "install jq"]).unwrap();
 
         // No flags: nothing to do
-        assert_eq!(handle_execution("brew install jq", &args), None);
+        assert_eq!(
+            handle_execution("brew install jq", &args),
+            ExecutionOutcome::none()
+        );
 
         // Dry-run: no execution, no exit code
         args.dry_run = true;
-        assert_eq!(handle_execution("brew install jq", &args), None);
+        assert_eq!(
+            handle_execution("brew install jq", &args),
+            ExecutionOutcome::none()
+        );
 
-        // Execute with empty output: error exit
+        // Execute with empty output: error exit, nothing executed
         args.dry_run = false;
         args.execute = true;
-        assert_eq!(handle_execution("   \n", &args), Some(1));
+        let outcome = handle_execution("   \n", &args);
+        assert_eq!(outcome.exit_code, Some(1));
+        assert!(!outcome.executed);
     }
 
     #[test]
     fn test_execute_commands_exit_codes() {
         assert_eq!(execute_commands("true"), 0);
         assert_eq!(execute_commands("exit 3"), 3);
+    }
+
+    fn history_fixture() -> History {
+        History {
+            history: vec![
+                HistoryEntry {
+                    timestamp: "2026-07-04T10:00:00+00:00".to_string(),
+                    query: "install docker".to_string(),
+                    command: "brew install --cask docker".to_string(),
+                    executed: true,
+                    success: Some(true),
+                },
+                HistoryEntry {
+                    timestamp: "2026-07-06T09:00:00+00:00".to_string(),
+                    query: "check git status".to_string(),
+                    command: "git status".to_string(),
+                    executed: true,
+                    success: Some(false),
+                },
+                HistoryEntry {
+                    timestamp: "2026-07-06T11:30:00+00:00".to_string(),
+                    query: "install jq".to_string(),
+                    command: "brew install jq".to_string(),
+                    executed: false,
+                    success: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_relative_time() {
+        let now = DateTime::parse_from_rfc3339("2026-07-06T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+
+        assert_eq!(
+            relative_time(at("2026-07-06T11:59:30+00:00"), now),
+            "just now"
+        );
+        assert_eq!(
+            relative_time(at("2026-07-06T11:45:00+00:00"), now),
+            "15 minutes ago"
+        );
+        assert_eq!(
+            relative_time(at("2026-07-06T11:00:00+00:00"), now),
+            "1 hour ago"
+        );
+        assert_eq!(
+            relative_time(at("2026-07-05T10:00:00+00:00"), now),
+            "yesterday"
+        );
+        assert_eq!(
+            relative_time(at("2026-07-01T12:00:00+00:00"), now),
+            "5 days ago"
+        );
+    }
+
+    #[test]
+    fn test_format_history_newest_first_with_markers() {
+        let now = DateTime::parse_from_rfc3339("2026-07-06T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let listing = format_history(&history_fixture().history, None, now);
+        let lines: Vec<&str> = listing.lines().collect();
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "1. brew install jq (30 minutes ago)");
+        assert_eq!(lines[1], "2. git status (3 hours ago) ✗");
+        assert_eq!(lines[2], "3. brew install --cask docker (2 days ago) ✓");
+    }
+
+    #[test]
+    fn test_format_history_search_keeps_numbering() {
+        let now = DateTime::parse_from_rfc3339("2026-07-06T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        // Matches query or command, case-insensitive, keeps global numbers
+        let listing = format_history(&history_fixture().history, Some("Docker"), now);
+        assert_eq!(listing, "3. brew install --cask docker (2 days ago) ✓");
+
+        assert!(format_history(&history_fixture().history, Some("nomatch"), now).is_empty());
+    }
+
+    #[test]
+    fn test_history_entry_by_number() {
+        let history = history_fixture();
+        assert_eq!(
+            history_entry_by_number(&history, 1).unwrap().command,
+            "brew install jq"
+        );
+        assert_eq!(
+            history_entry_by_number(&history, 3).unwrap().command,
+            "brew install --cask docker"
+        );
+        assert!(history_entry_by_number(&history, 0).is_none());
+        assert!(history_entry_by_number(&history, 4).is_none());
+    }
+
+    #[test]
+    fn test_history_serde_roundtrip() {
+        let json = serde_json::to_string(&history_fixture()).unwrap();
+        let parsed: History = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.history.len(), 3);
+        assert_eq!(parsed.history[0].query, "install docker");
+        assert_eq!(parsed.history[0].success, Some(true));
+        assert_eq!(parsed.history[2].success, None);
     }
 
     #[test]
@@ -1641,6 +1973,9 @@ mod tests {
             yes: false,
             dry_run: false,
             explain: false,
+            history: false,
+            history_search: None,
+            replay: None,
         };
 
         let provider = create_search_provider(&args);
@@ -1666,6 +2001,9 @@ mod tests {
             yes: false,
             dry_run: false,
             explain: false,
+            history: false,
+            history_search: None,
+            replay: None,
         };
 
         let provider = create_search_provider(&args);
@@ -1693,6 +2031,9 @@ mod tests {
             yes: false,
             dry_run: false,
             explain: false,
+            history: false,
+            history_search: None,
+            replay: None,
         };
 
         let provider = create_search_provider(&args);
@@ -1718,6 +2059,9 @@ mod tests {
             yes: false,
             dry_run: false,
             explain: false,
+            history: false,
+            history_search: None,
+            replay: None,
         };
 
         let provider = create_search_provider(&args);
@@ -1745,6 +2089,9 @@ mod tests {
             yes: false,
             dry_run: false,
             explain: false,
+            history: false,
+            history_search: None,
+            replay: None,
         };
 
         let provider = create_search_provider(&args);
@@ -1770,6 +2117,9 @@ mod tests {
             yes: false,
             dry_run: false,
             explain: false,
+            history: false,
+            history_search: None,
+            replay: None,
         };
 
         let provider = create_search_provider(&args);
@@ -1797,6 +2147,9 @@ mod tests {
             yes: false,
             dry_run: false,
             explain: false,
+            history: false,
+            history_search: None,
+            replay: None,
         };
 
         let provider = create_search_provider(&args);
@@ -1822,6 +2175,9 @@ mod tests {
             yes: false,
             dry_run: false,
             explain: false,
+            history: false,
+            history_search: None,
+            replay: None,
         };
 
         let provider = create_search_provider(&args);
