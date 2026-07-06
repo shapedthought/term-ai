@@ -58,6 +58,19 @@ struct Args {
     /// becomes an extra hint (e.g. the error message you saw).
     #[arg(long, short = 'f')]
     fix: bool,
+
+    /// Execute the generated command after confirmation
+    #[arg(long, short = 'x')]
+    execute: bool,
+
+    /// Skip the confirmation prompt when executing (dangerous commands
+    /// still require interactive confirmation)
+    #[arg(long, short = 'y', requires = "execute")]
+    yes: bool,
+
+    /// Show what would be executed without running it
+    #[arg(long, short = 'n', conflicts_with = "execute")]
+    dry_run: bool,
 }
 
 #[derive(Serialize)]
@@ -406,6 +419,103 @@ fn print_safety_warnings(output: &str) {
             eprintln!("⚠️  DANGEROUS: {}", warning);
         }
         eprintln!("Review carefully before running.");
+    }
+}
+
+/// Ask the user to confirm execution, reading from /dev/tty so it works
+/// even when stdin was consumed by a piped prompt
+fn confirm_execution(dangerous: bool, auto_yes: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    if auto_yes && !dangerous {
+        return Ok(true);
+    }
+    if auto_yes && dangerous {
+        eprintln!("Dangerous command detected — confirmation required despite --yes.");
+    }
+
+    let tty = std::fs::File::open("/dev/tty").map_err(|_| {
+        "No terminal available for confirmation. Run interactively, or use --yes (safe commands only)."
+    })?;
+
+    eprint!("Execute? [y/N]: ");
+    io::stderr().flush()?;
+
+    let mut answer = String::new();
+    BufReader::new(tty).read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+/// Run the generated commands in the user's shell, returning the exit code
+fn execute_commands(commands: &str) -> i32 {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+
+    match std::process::Command::new(&shell)
+        .arg("-c")
+        .arg(commands)
+        .status()
+    {
+        Ok(status) if status.success() => {
+            eprintln!("✓ Executed successfully");
+            0
+        }
+        Ok(status) => {
+            let code = status.code().unwrap_or(1);
+            eprintln!("✗ Command exited with code {}", code);
+            code
+        }
+        Err(e) => {
+            eprintln!("Error executing command: {}", e);
+            1
+        }
+    }
+}
+
+/// Extract the runnable command portion from output — verbose websearch
+/// output wraps it in [Search]/[Sources]/[Command] sections, and models
+/// sometimes add markdown code fences despite instructions
+fn executable_portion(text: &str) -> String {
+    let commands = match text.rsplit_once("[Command]\n") {
+        Some((_, commands)) => commands,
+        None => text,
+    };
+    commands
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("```"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// Handle --execute / --dry-run for generated output. Returns an exit code
+/// to terminate with, or None to continue normally.
+fn handle_execution(text: &str, args: &Args) -> Option<i32> {
+    let commands = executable_portion(text);
+
+    if args.dry_run {
+        eprintln!("\n⚠️  Preview only. Add --execute to run.");
+        return None;
+    }
+
+    if !args.execute {
+        return None;
+    }
+
+    if commands.is_empty() {
+        eprintln!("Nothing to execute.");
+        return Some(1);
+    }
+
+    let dangerous = !lint_commands(&commands).is_empty();
+    match confirm_execution(dangerous, args.yes) {
+        Ok(true) => Some(execute_commands(&commands)),
+        Ok(false) => {
+            eprintln!("Skipped.");
+            None
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            Some(1)
+        }
     }
 }
 
@@ -984,14 +1094,18 @@ fn main() {
 
         eprintln!("Fixing: {}", last.command);
         let prompt = build_fix_prompt(&last, error_output.as_deref(), args.prompt.as_deref());
-        let result =
-            call_ollama(&prompt, &args.model, &args.endpoint, &mut io::stdout()).map(|text| {
+        match call_ollama(&prompt, &args.model, &args.endpoint, &mut io::stdout()) {
+            Ok(text) => {
                 println!();
                 print_safety_warnings(&text);
-            });
-        if let Err(e) = result {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
+                if let Some(code) = handle_execution(&text, &args) {
+                    std::process::exit(code);
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -1026,7 +1140,7 @@ fn main() {
         )
         .map(|text| {
             println!("{}", text);
-            print_safety_warnings(&text);
+            text
         })
     } else {
         // Default mode - streams tokens to stdout as they arrive
@@ -1039,13 +1153,21 @@ fn main() {
         )
         .map(|text| {
             println!();
-            print_safety_warnings(&text);
+            text
         })
     };
 
-    if let Err(e) = result {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
+    match result {
+        Ok(text) => {
+            print_safety_warnings(&text);
+            if let Some(code) = handle_execution(&text, &args) {
+                std::process::exit(code);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1164,6 +1286,57 @@ mod tests {
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["query"].is_object());
         assert_eq!(params["required"][0], "query");
+    }
+
+    #[test]
+    fn test_executable_portion() {
+        // Plain output is used as-is
+        assert_eq!(executable_portion("brew install jq\n"), "brew install jq");
+
+        // Verbose websearch output: only the [Command] section is runnable
+        let verbose = "[Search]\nProvider: brave\nSearched for: x\n\n[Sources]\n1. A - b\n\n[Command]\nbrew install node@22\n";
+        assert_eq!(executable_portion(verbose), "brew install node@22");
+
+        // Markdown code fences are stripped (models add them despite instructions)
+        assert_eq!(executable_portion("```\nexit 7\n```"), "exit 7");
+        assert_eq!(
+            executable_portion("```sh\nbrew install jq\nbrew install ripgrep\n```\n"),
+            "brew install jq\nbrew install ripgrep"
+        );
+    }
+
+    #[test]
+    fn test_execute_flag_relationships() {
+        // --yes requires --execute
+        assert!(Args::try_parse_from(["term-ai", "install jq", "--yes"]).is_err());
+        assert!(Args::try_parse_from(["term-ai", "install jq", "--execute", "--yes"]).is_ok());
+
+        // --dry-run conflicts with --execute
+        assert!(Args::try_parse_from(["term-ai", "install jq", "--dry-run", "--execute"]).is_err());
+        assert!(Args::try_parse_from(["term-ai", "install jq", "--dry-run"]).is_ok());
+    }
+
+    #[test]
+    fn test_handle_execution_passive_modes() {
+        let mut args = Args::try_parse_from(["term-ai", "install jq"]).unwrap();
+
+        // No flags: nothing to do
+        assert_eq!(handle_execution("brew install jq", &args), None);
+
+        // Dry-run: no execution, no exit code
+        args.dry_run = true;
+        assert_eq!(handle_execution("brew install jq", &args), None);
+
+        // Execute with empty output: error exit
+        args.dry_run = false;
+        args.execute = true;
+        assert_eq!(handle_execution("   \n", &args), Some(1));
+    }
+
+    #[test]
+    fn test_execute_commands_exit_codes() {
+        assert_eq!(execute_commands("true"), 0);
+        assert_eq!(execute_commands("exit 3"), 3);
     }
 
     #[test]
@@ -1409,6 +1582,9 @@ mod tests {
             verbose: false,
             list_models: false,
             fix: false,
+            execute: false,
+            yes: false,
+            dry_run: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1430,6 +1606,9 @@ mod tests {
             verbose: false,
             list_models: false,
             fix: false,
+            execute: false,
+            yes: false,
+            dry_run: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1453,6 +1632,9 @@ mod tests {
             verbose: false,
             list_models: false,
             fix: false,
+            execute: false,
+            yes: false,
+            dry_run: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1474,6 +1656,9 @@ mod tests {
             verbose: false,
             list_models: false,
             fix: false,
+            execute: false,
+            yes: false,
+            dry_run: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1497,6 +1682,9 @@ mod tests {
             verbose: false,
             list_models: false,
             fix: false,
+            execute: false,
+            yes: false,
+            dry_run: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1518,6 +1706,9 @@ mod tests {
             verbose: false,
             list_models: false,
             fix: false,
+            execute: false,
+            yes: false,
+            dry_run: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1541,6 +1732,9 @@ mod tests {
             verbose: false,
             list_models: false,
             fix: false,
+            execute: false,
+            yes: false,
+            dry_run: false,
         };
 
         let provider = create_search_provider(&args);
@@ -1562,6 +1756,9 @@ mod tests {
             verbose: false,
             list_models: false,
             fix: false,
+            execute: false,
+            yes: false,
+            dry_run: false,
         };
 
         let provider = create_search_provider(&args);
