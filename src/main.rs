@@ -98,6 +98,11 @@ struct Args {
         conflicts_with_all = ["fix", "list_models", "history", "history_search", "replay"]
     )]
     interactive: bool,
+
+    /// Disable automatic environment context (project type, git status,
+    /// directory listing) in the prompt
+    #[arg(long)]
+    no_context: bool,
 }
 
 #[derive(Serialize)]
@@ -295,7 +300,7 @@ impl SearchProvider for BraveProvider {
 }
 
 /// Build the final prompt with system instructions and user request
-fn build_prompt(user_request: &str, explain: bool) -> String {
+fn build_prompt(user_request: &str, explain: bool, context: Option<&str>) -> String {
     let current_date = Utc::now().format("%B %d, %Y").to_string();
     format!(
         "You are an expert macOS terminal and development environment engineer.
@@ -304,12 +309,15 @@ Constraints:
 {}
 - Prefer Homebrew for package installation where appropriate.
 - Avoid destructive operations (no rm -rf, no disk formatting, no sudo unless clearly necessary and safe).
-
+{}
 Current date: {}
 
 User request:
 {}",
         format_rules(explain),
+        context
+            .map(|c| format!("\n{}\n", c))
+            .unwrap_or_default(),
         current_date,
         user_request
     )
@@ -430,6 +438,146 @@ fn history_entry_by_number(history: &History, number: usize) -> Option<&HistoryE
         return None;
     }
     history.history.get(len - number)
+}
+
+// --- Environment context ---
+
+/// Detect project types from marker files in `dir`
+fn detect_project_types(dir: &std::path::Path) -> Vec<String> {
+    let has = |name: &str| dir.join(name).exists();
+    let mut types = Vec::new();
+
+    if has("Cargo.toml") {
+        types.push("Rust (Cargo)".to_string());
+    }
+    if has("package.json") {
+        let pm = if has("pnpm-lock.yaml") {
+            "pnpm"
+        } else if has("yarn.lock") {
+            "yarn"
+        } else if has("bun.lockb") || has("bun.lock") {
+            "bun"
+        } else {
+            "npm"
+        };
+        types.push(format!("Node.js ({})", pm));
+    }
+    if has("pyproject.toml") || has("requirements.txt") || has("setup.py") {
+        let tool = if has("uv.lock") {
+            "uv"
+        } else if has("poetry.lock") {
+            "poetry"
+        } else {
+            "pip"
+        };
+        types.push(format!("Python ({})", tool));
+    }
+    if has("go.mod") {
+        types.push("Go".to_string());
+    }
+    if has("Gemfile") {
+        types.push("Ruby (Bundler)".to_string());
+    }
+    if has("pom.xml") {
+        types.push("Java (Maven)".to_string());
+    }
+    if has("build.gradle") || has("build.gradle.kts") {
+        types.push("Java/Kotlin (Gradle)".to_string());
+    }
+    if has("Dockerfile") {
+        types.push("Docker".to_string());
+    }
+    if has("docker-compose.yml") || has("docker-compose.yaml") || has("compose.yaml") {
+        types.push("Docker Compose".to_string());
+    }
+    if has("Makefile") {
+        types.push("Make".to_string());
+    }
+    types
+}
+
+/// Short git summary (branch + uncommitted change count), or None when
+/// `dir` isn't a git repository or git isn't available
+fn git_summary(dir: &std::path::Path) -> Option<String> {
+    let run = |git_args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(git_args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+
+    let branch = run(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let changes = run(&["status", "--porcelain"])
+        .map(|s| if s.is_empty() { 0 } else { s.lines().count() })
+        .unwrap_or(0);
+
+    Some(if changes == 0 {
+        format!("branch {}, clean", branch)
+    } else {
+        format!("branch {}, {} uncommitted change(s)", branch, changes)
+    })
+}
+
+const CONTEXT_LISTING_LIMIT: usize = 20;
+
+/// Non-hidden top-level entries of `dir`, directories marked with '/'
+fn directory_listing(dir: &std::path::Path, limit: usize) -> String {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return String::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                return None;
+            }
+            Some(if e.path().is_dir() {
+                format!("{}/", name)
+            } else {
+                name
+            })
+        })
+        .collect();
+    names.sort();
+    let total = names.len();
+    if total > limit {
+        names.truncate(limit);
+        names.push(format!("(+{} more)", total - limit));
+    }
+    names.join(", ")
+}
+
+/// Compact environment-context block for the system prompt
+fn gather_context(dir: &std::path::Path) -> String {
+    let mut lines = vec![format!(
+        "- OS: {} ({})",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )];
+    if let Ok(shell) = std::env::var("SHELL") {
+        lines.push(format!("- Shell: {}", shell));
+    }
+    lines.push(format!("- Directory: {}", dir.display()));
+    let types = detect_project_types(dir);
+    if !types.is_empty() {
+        lines.push(format!("- Project type: {}", types.join(", ")));
+    }
+    if let Some(git) = git_summary(dir) {
+        lines.push(format!("- Git: {}", git));
+    }
+    let listing = directory_listing(dir, CONTEXT_LISTING_LIMIT);
+    if !listing.is_empty() {
+        lines.push(format!("- Files: {}", listing));
+    }
+    format!(
+        "Environment context (use this to tailor commands, e.g. the right package manager or test runner):\n{}",
+        lines.join("\n")
+    )
 }
 
 /// Output-format rules for the system prompt, depending on explain mode
@@ -795,6 +943,7 @@ fn build_fix_prompt(
     last: &LastCommand,
     error_output: Option<&str>,
     user_hint: Option<&str>,
+    context: Option<&str>,
 ) -> String {
     let current_date = Utc::now().format("%B %d, %Y").to_string();
     let mut prompt = format!(
@@ -822,6 +971,9 @@ Failed command:
     }
     if let Some(hint) = user_hint {
         prompt.push_str(&format!("\n\nAdditional context from the user:\n{}", hint));
+    }
+    if let Some(ctx) = context {
+        prompt.push_str(&format!("\n\n{}", ctx));
     }
     prompt
 }
@@ -1016,7 +1168,7 @@ fn create_search_provider(
 
 /// Build initial messages for chat API
 /// Build the system message for chat conversations
-fn system_message(explain: bool, websearch: bool) -> Message {
+fn system_message(explain: bool, websearch: bool, context: Option<&str>) -> Message {
     let current_date = Utc::now().format("%B %d, %Y").to_string();
     let websearch_note = if websearch {
         "\n\nWhen you need current information (latest versions, recent releases, current documentation), use the web_search tool to find up-to-date information before responding."
@@ -1030,10 +1182,13 @@ Constraints:
 {}
 - Prefer Homebrew for package installation where appropriate.
 - Avoid destructive operations (no rm -rf, no disk formatting, no sudo unless clearly necessary and safe).{}
-
+{}
 Current date: {}",
         format_rules(explain),
         websearch_note,
+        context
+            .map(|c| format!("\n{}\n", c))
+            .unwrap_or_default(),
         current_date
     );
     Message {
@@ -1043,9 +1198,13 @@ Current date: {}",
     }
 }
 
-fn build_initial_messages(user_request: &str, explain: bool) -> Vec<Message> {
+fn build_initial_messages(
+    user_request: &str,
+    explain: bool,
+    context: Option<&str>,
+) -> Vec<Message> {
     vec![
-        system_message(explain, true),
+        system_message(explain, true, context),
         Message {
             role: "user".to_string(),
             content: user_request.to_string(),
@@ -1303,6 +1462,7 @@ fn run_tool_loop(
     .into())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chat_with_tools(
     user_request: &str,
     model: &str,
@@ -1311,8 +1471,9 @@ fn chat_with_tools(
     max_results: usize,
     verbose: bool,
     explain: bool,
+    context: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut messages = build_initial_messages(user_request, explain);
+    let mut messages = build_initial_messages(user_request, explain, context);
     let mut trace = SearchTrace::default();
 
     let final_response = run_tool_loop(
@@ -1357,6 +1518,14 @@ fn chat_with_tools(
     Ok(output)
 }
 
+/// Environment context for the prompt, unless disabled with --no-context
+fn environment_context(args: &Args) -> Option<String> {
+    if args.no_context {
+        return None;
+    }
+    std::env::current_dir().ok().map(|dir| gather_context(&dir))
+}
+
 /// Interactive REPL: keeps conversation context across queries
 fn run_repl(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let provider: Option<Box<dyn SearchProvider>> = if args.websearch {
@@ -1373,7 +1542,12 @@ fn run_repl(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("term-ai interactive mode — describe what you need, or 'help' for commands.");
 
-    let mut messages = vec![system_message(args.explain, args.websearch)];
+    let context = environment_context(args);
+    let mut messages = vec![system_message(
+        args.explain,
+        args.websearch,
+        context.as_deref(),
+    )];
     let mut pending = args.prompt.clone();
 
     loop {
@@ -1579,7 +1753,13 @@ fn main() {
         };
 
         eprintln!("Fixing: {}", last.command);
-        let prompt = build_fix_prompt(&last, error_output.as_deref(), args.prompt.as_deref());
+        let context = environment_context(&args);
+        let prompt = build_fix_prompt(
+            &last,
+            error_output.as_deref(),
+            args.prompt.as_deref(),
+            context.as_deref(),
+        );
         match call_ollama(&prompt, &args.model, &args.endpoint, &mut io::stdout()) {
             Ok(text) => {
                 println!();
@@ -1631,6 +1811,7 @@ fn main() {
             args.max_results,
             args.verbose,
             args.explain,
+            environment_context(&args).as_deref(),
         )
         .map(|text| {
             println!("{}", text);
@@ -1638,7 +1819,11 @@ fn main() {
         })
     } else {
         // Default mode - streams tokens to stdout as they arrive
-        let final_prompt = build_prompt(&user_prompt, args.explain);
+        let final_prompt = build_prompt(
+            &user_prompt,
+            args.explain,
+            environment_context(&args).as_deref(),
+        );
         call_ollama(
             &final_prompt,
             &args.model,
@@ -1679,7 +1864,7 @@ mod tests {
     #[test]
     fn test_build_prompt_includes_system_instructions() {
         let user_request = "install rust";
-        let prompt = build_prompt(user_request, false);
+        let prompt = build_prompt(user_request, false, None);
 
         // Verify system prompt is included
         assert!(prompt.contains("You are an expert macOS terminal"));
@@ -1702,8 +1887,8 @@ mod tests {
         let request1 = "setup zsh";
         let request2 = "install node";
 
-        let prompt1 = build_prompt(request1, false);
-        let prompt2 = build_prompt(request2, false);
+        let prompt1 = build_prompt(request1, false, None);
+        let prompt2 = build_prompt(request2, false, None);
 
         assert!(prompt1.contains(request1));
         assert!(prompt2.contains(request2));
@@ -1714,8 +1899,8 @@ mod tests {
     #[test]
     fn test_build_prompt_consistency() {
         let request = "test request";
-        let prompt1 = build_prompt(request, false);
-        let prompt2 = build_prompt(request, false);
+        let prompt1 = build_prompt(request, false, None);
+        let prompt2 = build_prompt(request, false, None);
 
         // Same request should produce identical prompts (within same second)
         assert_eq!(prompt1, prompt2);
@@ -1724,7 +1909,7 @@ mod tests {
     #[test]
     fn test_build_prompt_includes_date() {
         let request = "install rust";
-        let prompt = build_prompt(request, false);
+        let prompt = build_prompt(request, false, None);
 
         // Verify date is included
         assert!(prompt.contains("Current date:"));
@@ -1751,7 +1936,7 @@ mod tests {
     #[test]
     fn test_build_initial_messages() {
         let user_request = "install rust";
-        let messages = build_initial_messages(user_request, false);
+        let messages = build_initial_messages(user_request, false, None);
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
@@ -1764,8 +1949,8 @@ mod tests {
     #[test]
     fn test_build_initial_messages_explain() {
         let user_request = "install rust";
-        let messages_explain = build_initial_messages(user_request, true);
-        let messages_normal = build_initial_messages(user_request, false);
+        let messages_explain = build_initial_messages(user_request, true, None);
+        let messages_normal = build_initial_messages(user_request, false, None);
 
         assert_eq!(messages_explain.len(), 2);
         assert!(messages_explain[0].content.contains("Explanation:"));
@@ -1775,13 +1960,13 @@ mod tests {
 
     #[test]
     fn test_build_prompt_explain() {
-        let prompt = build_prompt("find large files", true);
+        let prompt = build_prompt("find large files", true, None);
         assert!(prompt.contains("Explanation:"));
         assert!(prompt.contains("one bullet per part"));
         // Safety constraint applies in both modes
         assert!(prompt.contains("Avoid destructive operations"));
 
-        let normal = build_prompt("find large files", false);
+        let normal = build_prompt("find large files", false, None);
         assert!(normal.contains("Respond ONLY with valid shell commands"));
         assert!(!normal.contains("Explanation:"));
     }
@@ -1988,16 +2173,93 @@ mod tests {
         assert_eq!(parsed.history[2].success, None);
     }
 
+    fn temp_project_dir(name: &str, markers: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("term-ai-test-{}", name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for marker in markers {
+            std::fs::write(dir.join(marker), "").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn test_detect_project_types() {
+        let rust = temp_project_dir("rust", &["Cargo.toml"]);
+        assert_eq!(detect_project_types(&rust), vec!["Rust (Cargo)"]);
+
+        let node_pnpm = temp_project_dir("node", &["package.json", "pnpm-lock.yaml"]);
+        assert_eq!(detect_project_types(&node_pnpm), vec!["Node.js (pnpm)"]);
+
+        let python_uv = temp_project_dir("py", &["pyproject.toml", "uv.lock"]);
+        assert_eq!(detect_project_types(&python_uv), vec!["Python (uv)"]);
+
+        let multi = temp_project_dir("multi", &["package.json", "Dockerfile", "Makefile"]);
+        let types = detect_project_types(&multi);
+        assert!(types.contains(&"Node.js (npm)".to_string()));
+        assert!(types.contains(&"Docker".to_string()));
+        assert!(types.contains(&"Make".to_string()));
+
+        let empty = temp_project_dir("empty", &[]);
+        assert!(detect_project_types(&empty).is_empty());
+    }
+
+    #[test]
+    fn test_directory_listing() {
+        let dir = temp_project_dir("listing", &["b.txt", "a.txt", ".hidden"]);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+
+        // Sorted, hidden files excluded, directories marked
+        assert_eq!(directory_listing(&dir, 20), "a.txt, b.txt, src/");
+
+        // Limit adds an overflow marker
+        assert_eq!(directory_listing(&dir, 2), "a.txt, b.txt, (+1 more)");
+
+        assert_eq!(
+            directory_listing(std::path::Path::new("/nonexistent-xyz"), 20),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_gather_context() {
+        let dir = temp_project_dir("ctx", &["Cargo.toml"]);
+        let context = gather_context(&dir);
+
+        assert!(context.contains("Environment context"));
+        assert!(context.contains("- OS: "));
+        assert!(context.contains(&format!("- Directory: {}", dir.display())));
+        assert!(context.contains("Project type: Rust (Cargo)"));
+    }
+
+    #[test]
+    fn test_prompts_include_context() {
+        let prompt = build_prompt(
+            "run tests",
+            false,
+            Some("Environment context:\n- OS: macos"),
+        );
+        assert!(prompt.contains("Environment context:"));
+        assert!(prompt.contains("- OS: macos"));
+
+        let msg = system_message(false, false, Some("Environment context:\n- OS: macos"));
+        assert!(msg.content.contains("Environment context:"));
+
+        // Without context, no leftover placeholder
+        let bare = build_prompt("run tests", false, None);
+        assert!(!bare.contains("Environment context"));
+    }
+
     #[test]
     fn test_system_message() {
-        let with_search = system_message(false, true);
+        let with_search = system_message(false, true, None);
         assert_eq!(with_search.role, "system");
         assert!(with_search.content.contains("web_search tool"));
 
-        let without_search = system_message(false, false);
+        let without_search = system_message(false, false, None);
         assert!(!without_search.content.contains("web_search tool"));
 
-        let explain = system_message(true, false);
+        let explain = system_message(true, false, None);
         assert!(explain.content.contains("Explanation:"));
     }
 
@@ -2077,7 +2339,12 @@ mod tests {
             command: "git pussh origin main".to_string(),
             exit_code: Some(1),
         };
-        let prompt = build_fix_prompt(&last, Some("git: 'pussh' is not a git command."), None);
+        let prompt = build_fix_prompt(
+            &last,
+            Some("git: 'pussh' is not a git command."),
+            None,
+            None,
+        );
 
         assert!(prompt.contains("A shell command failed"));
         assert!(prompt.contains("git pussh origin main"));
@@ -2093,7 +2360,7 @@ mod tests {
             command: "ls -z".to_string(),
             exit_code: None,
         };
-        let prompt = build_fix_prompt(&last, None, Some("I wanted human-readable sizes"));
+        let prompt = build_fix_prompt(&last, None, Some("I wanted human-readable sizes"), None);
 
         assert!(prompt.contains("ls -z"));
         assert!(!prompt.contains("Exit code:"));
@@ -2282,6 +2549,7 @@ mod tests {
             history_search: None,
             replay: None,
             interactive: false,
+            no_context: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2311,6 +2579,7 @@ mod tests {
             history_search: None,
             replay: None,
             interactive: false,
+            no_context: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2342,6 +2611,7 @@ mod tests {
             history_search: None,
             replay: None,
             interactive: false,
+            no_context: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2371,6 +2641,7 @@ mod tests {
             history_search: None,
             replay: None,
             interactive: false,
+            no_context: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2402,6 +2673,7 @@ mod tests {
             history_search: None,
             replay: None,
             interactive: false,
+            no_context: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2431,6 +2703,7 @@ mod tests {
             history_search: None,
             replay: None,
             interactive: false,
+            no_context: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2462,6 +2735,7 @@ mod tests {
             history_search: None,
             replay: None,
             interactive: false,
+            no_context: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2491,6 +2765,7 @@ mod tests {
             history_search: None,
             replay: None,
             interactive: false,
+            no_context: false,
         };
 
         let provider = create_search_provider(&args);
