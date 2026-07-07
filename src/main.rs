@@ -112,6 +112,20 @@ struct Args {
     /// response
     #[arg(long, short = 's')]
     stats: bool,
+
+    /// Context window size (num_ctx) to request from Ollama. Also makes
+    /// the --stats context numbers exact instead of estimated.
+    #[arg(long, env = "TERM_AI_NUM_CTX", value_name = "TOKENS")]
+    num_ctx: Option<u64>,
+}
+
+#[derive(Serialize, Clone, Copy)]
+struct OllamaOptions {
+    num_ctx: u64,
+}
+
+fn request_options(num_ctx: Option<u64>) -> Option<OllamaOptions> {
+    num_ctx.map(|num_ctx| OllamaOptions { num_ctx })
 }
 
 #[derive(Serialize)]
@@ -119,6 +133,8 @@ struct OllamaRequest {
     model: String,
     prompt: String,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<OllamaOptions>,
 }
 
 /// One NDJSON line of Ollama's streaming /api/generate response
@@ -161,9 +177,9 @@ impl InferenceStats {
     }
 }
 
-/// Format a stats line. The context limit is an estimate (~) because the
-/// effective window depends on Ollama's runtime num_ctx setting.
-fn format_stats(stats: &InferenceStats, context_limit: Option<u64>) -> String {
+/// Format a stats line. A probed context limit is an estimate (~); an
+/// explicit --num-ctx is exact.
+fn format_stats(stats: &InferenceStats, context_limit: Option<u64>, exact: bool) -> String {
     let eval_secs = stats.eval_duration_ns as f64 / 1e9;
     let tokens_per_sec = if eval_secs > 0.0 {
         stats.output_tokens as f64 / eval_secs
@@ -175,12 +191,15 @@ fn format_stats(stats: &InferenceStats, context_limit: Option<u64>) -> String {
 
     let context_part = match context_limit {
         Some(limit) if limit > 0 => {
+            let approx = if exact { "" } else { "~" };
             let percent = used * 100 / limit;
             format!(
-                " · context ~{}/{} ({}%), ~{} left",
+                " · context {}{}/{} ({}%), {}{} left",
+                approx,
                 used,
                 limit,
                 percent,
+                approx,
                 limit.saturating_sub(used)
             )
         }
@@ -260,6 +279,8 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<Tool>>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<OllamaOptions>,
 }
 
 #[derive(Deserialize)]
@@ -1336,6 +1357,7 @@ fn call_ollama(
     prompt: &str,
     model: &str,
     endpoint: &str,
+    num_ctx: Option<u64>,
     out: &mut dyn Write,
 ) -> Result<(String, Option<InferenceStats>), Box<dyn std::error::Error>> {
     let client = Client::new();
@@ -1345,6 +1367,7 @@ fn call_ollama(
         model: model.to_string(),
         prompt: prompt.to_string(),
         stream: true,
+        options: request_options(num_ctx),
     };
 
     let response = client
@@ -1548,6 +1571,7 @@ fn call_ollama_chat_streaming(
     messages: &[Message],
     model: &str,
     endpoint: &str,
+    num_ctx: Option<u64>,
     out: &mut dyn Write,
 ) -> Result<(String, Option<InferenceStats>), Box<dyn std::error::Error>> {
     let client = Client::new();
@@ -1558,6 +1582,7 @@ fn call_ollama_chat_streaming(
         messages: messages.to_vec(),
         tools: None,
         stream: true,
+        options: request_options(num_ctx),
     };
 
     let response = client
@@ -1614,6 +1639,7 @@ fn call_ollama_chat(
     tools: Option<Vec<Tool>>,
     model: &str,
     endpoint: &str,
+    num_ctx: Option<u64>,
 ) -> Result<ChatResponse, Box<dyn std::error::Error>> {
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
@@ -1624,6 +1650,7 @@ fn call_ollama_chat(
         messages: messages.to_vec(),
         tools,
         stream: false,
+        options: request_options(num_ctx),
     };
 
     let response = client
@@ -1674,10 +1701,12 @@ struct SearchTrace {
 /// Run the chat tool loop until the model stops calling tools, mutating
 /// `messages` in place (the final assistant reply is pushed too, so callers
 /// can keep the conversation going). Returns the final response content.
+#[allow(clippy::too_many_arguments)]
 fn run_tool_loop(
     messages: &mut Vec<Message>,
     model: &str,
     endpoint: &str,
+    num_ctx: Option<u64>,
     provider: &dyn SearchProvider,
     max_results: usize,
     trace: &mut SearchTrace,
@@ -1687,7 +1716,7 @@ fn run_tool_loop(
     const MAX_ITERATIONS: usize = 10;
 
     for _iteration in 0..MAX_ITERATIONS {
-        let response = call_ollama_chat(messages, Some(tools.clone()), model, endpoint)?;
+        let response = call_ollama_chat(messages, Some(tools.clone()), model, endpoint, num_ctx)?;
 
         // Check if the model made tool calls
         if let Some(tool_calls) = &response.message.tool_calls {
@@ -1772,6 +1801,7 @@ fn chat_with_tools(
     user_request: &str,
     model: &str,
     endpoint: &str,
+    num_ctx: Option<u64>,
     provider: &dyn SearchProvider,
     max_results: usize,
     verbose: bool,
@@ -1785,6 +1815,7 @@ fn chat_with_tools(
         &mut messages,
         model,
         endpoint,
+        num_ctx,
         provider,
         max_results,
         &mut trace,
@@ -1824,9 +1855,18 @@ fn chat_with_tools(
 }
 
 /// Print a stats line to stderr when stats are available
-fn print_stats_line(stats: Option<InferenceStats>, context_limit: Option<u64>) {
+fn print_stats_line(stats: Option<InferenceStats>, context_limit: Option<u64>, exact: bool) {
     if let Some(stats) = stats {
-        eprintln!("{}", format_stats(&stats, context_limit));
+        eprintln!("{}", format_stats(&stats, context_limit, exact));
+    }
+}
+
+/// The context limit to display: an explicit --num-ctx is exact; otherwise
+/// probe the server for an estimate. Returns (limit, is_exact).
+fn effective_context_limit(args: &Args) -> (Option<u64>, bool) {
+    match args.num_ctx {
+        Some(limit) => (Some(limit), true),
+        None => (model_context_limit(&args.model, &args.endpoint), false),
     }
 }
 
@@ -1854,7 +1894,7 @@ fn run_repl(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("term-ai interactive mode — describe what you need, or 'help' for commands.");
 
-    let context_limit = model_context_limit(&args.model, &args.endpoint);
+    let (context_limit, ctx_exact) = effective_context_limit(args);
     let mut last_stats: Option<InferenceStats> = None;
 
     let context = environment_context(args);
@@ -1907,7 +1947,7 @@ fn run_repl(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             }
             "stats" => {
                 match last_stats {
-                    Some(stats) => eprintln!("{}", format_stats(&stats, context_limit)),
+                    Some(stats) => eprintln!("{}", format_stats(&stats, context_limit, ctx_exact)),
                     None => eprintln!("No completed turns yet."),
                 }
                 continue;
@@ -1934,6 +1974,7 @@ fn run_repl(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 &mut messages,
                 &args.model,
                 &args.endpoint,
+                args.num_ctx,
                 provider.as_ref(),
                 args.max_results,
                 &mut trace,
@@ -1944,18 +1985,24 @@ fn run_repl(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 (text, stats)
             })
         } else {
-            call_ollama_chat_streaming(&messages, &args.model, &args.endpoint, &mut io::stdout())
-                .map(|(text, stats)| {
-                    println!();
-                    (text, stats)
-                })
+            call_ollama_chat_streaming(
+                &messages,
+                &args.model,
+                &args.endpoint,
+                args.num_ctx,
+                &mut io::stdout(),
+            )
+            .map(|(text, stats)| {
+                println!();
+                (text, stats)
+            })
         };
 
         match response {
             Ok((text, stats)) => {
                 last_stats = stats;
                 if args.stats {
-                    print_stats_line(stats, context_limit);
+                    print_stats_line(stats, context_limit, ctx_exact);
                 }
                 if provider.is_none() {
                     // run_tool_loop keeps context itself; the streaming path
@@ -2090,11 +2137,18 @@ fn main() {
             args.prompt.as_deref(),
             context.as_deref(),
         );
-        match call_ollama(&prompt, &args.model, &args.endpoint, &mut io::stdout()) {
+        match call_ollama(
+            &prompt,
+            &args.model,
+            &args.endpoint,
+            args.num_ctx,
+            &mut io::stdout(),
+        ) {
             Ok((text, stats)) => {
                 println!();
                 if args.stats {
-                    print_stats_line(stats, model_context_limit(&args.model, &args.endpoint));
+                    let (limit, exact) = effective_context_limit(&args);
+                    print_stats_line(stats, limit, exact);
                 }
                 print_safety_warnings(&text);
                 let outcome = handle_execution(&text, &args);
@@ -2140,6 +2194,7 @@ fn main() {
             &user_prompt,
             &args.model,
             &args.endpoint,
+            args.num_ctx,
             provider.as_ref(),
             args.max_results,
             args.verbose,
@@ -2161,6 +2216,7 @@ fn main() {
             &final_prompt,
             &args.model,
             &args.endpoint,
+            args.num_ctx,
             &mut io::stdout(),
         )
         .map(|(text, stats)| {
@@ -2172,7 +2228,8 @@ fn main() {
     match result {
         Ok((text, stats)) => {
             if args.stats {
-                print_stats_line(stats, model_context_limit(&args.model, &args.endpoint));
+                let (limit, exact) = effective_context_limit(&args);
+                print_stats_line(stats, limit, exact);
             }
             print_safety_warnings(&text);
             let (outcome, history_command) = if args.alternatives {
@@ -2909,14 +2966,19 @@ mod tests {
             total_duration_ns: 900_000_000,
         };
 
-        let line = format_stats(&stats, Some(4096));
+        let line = format_stats(&stats, Some(4096), false);
         assert_eq!(
             line,
             "[stats] 8 tokens in 0.4s (20.0 tok/s) \u{b7} prompt 212 tokens \u{b7} total 0.9s \u{b7} context ~220/4096 (5%), ~3876 left"
         );
 
+        // Exact limit (--num-ctx): no tildes
+        let exact = format_stats(&stats, Some(8192), true);
+        assert!(exact.contains("context 220/8192 (2%), 7972 left"));
+        assert!(!exact.contains('~'));
+
         // Without a known limit, still shows usage
-        let line = format_stats(&stats, None);
+        let line = format_stats(&stats, None, false);
         assert!(line.contains("context 220 tokens used"));
 
         // Zero eval duration doesn't divide by zero
@@ -2926,7 +2988,7 @@ mod tests {
             eval_duration_ns: 0,
             total_duration_ns: 0,
         };
-        assert!(format_stats(&zero, None).contains("(0.0 tok/s)"));
+        assert!(format_stats(&zero, None, false).contains("(0.0 tok/s)"));
     }
 
     #[test]
@@ -3021,6 +3083,7 @@ mod tests {
             no_context: false,
             alternatives: false,
             stats: false,
+            num_ctx: None,
         };
 
         let provider = create_search_provider(&args);
@@ -3053,6 +3116,7 @@ mod tests {
             no_context: false,
             alternatives: false,
             stats: false,
+            num_ctx: None,
         };
 
         let provider = create_search_provider(&args);
@@ -3087,6 +3151,7 @@ mod tests {
             no_context: false,
             alternatives: false,
             stats: false,
+            num_ctx: None,
         };
 
         let provider = create_search_provider(&args);
@@ -3119,6 +3184,7 @@ mod tests {
             no_context: false,
             alternatives: false,
             stats: false,
+            num_ctx: None,
         };
 
         let provider = create_search_provider(&args);
@@ -3153,6 +3219,7 @@ mod tests {
             no_context: false,
             alternatives: false,
             stats: false,
+            num_ctx: None,
         };
 
         let provider = create_search_provider(&args);
@@ -3185,6 +3252,7 @@ mod tests {
             no_context: false,
             alternatives: false,
             stats: false,
+            num_ctx: None,
         };
 
         let provider = create_search_provider(&args);
@@ -3219,6 +3287,7 @@ mod tests {
             no_context: false,
             alternatives: false,
             stats: false,
+            num_ctx: None,
         };
 
         let provider = create_search_provider(&args);
@@ -3251,6 +3320,7 @@ mod tests {
             no_context: false,
             alternatives: false,
             stats: false,
+            num_ctx: None,
         };
 
         let provider = create_search_provider(&args);

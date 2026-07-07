@@ -105,9 +105,17 @@ brew install jq
 
 This matters most in the REPL, where the conversation quietly grows toward
 the context limit — `--stats` prints a line after each turn, and the
-`stats` command shows the latest numbers anytime. The limit is an estimate
-(from `num_ctx` or the model card via `/api/show`); stats go to stderr so
+`stats` command shows the latest numbers anytime. Stats go to stderr so
 stdout stays pipeable.
+
+The context window is configurable with `--num-ctx` (or `TERM_AI_NUM_CTX`),
+which both requests that window from Ollama — long REPL sessions otherwise
+truncate at Ollama's 4096-token default — and makes the stats numbers exact
+instead of estimated (`~`):
+
+```bash
+term-ai -i --num-ctx 16384 --stats
+```
 
 ### Context Awareness
 
@@ -374,6 +382,10 @@ Options:
   -s, --stats
           Show inference stats (tokens, speed, context usage) after each
           response
+
+  --num-ctx <TOKENS>
+          Context window size (num_ctx) to request from Ollama
+          [env: TERM_AI_NUM_CTX=]
 
   -h, --help
           Print help
