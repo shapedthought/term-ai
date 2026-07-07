@@ -107,6 +107,11 @@ struct Args {
     /// Offer 2-3 alternative approaches; with --execute, pick one to run
     #[arg(long, short = 'a', conflicts_with_all = ["explain", "fix"])]
     alternatives: bool,
+
+    /// Show inference stats (tokens, speed, context usage) after each
+    /// response
+    #[arg(long, short = 's')]
+    stats: bool,
 }
 
 #[derive(Serialize)]
@@ -124,6 +129,119 @@ struct StreamChunk {
     #[serde(default)]
     done: bool,
     error: Option<String>,
+    prompt_eval_count: Option<u64>,
+    eval_count: Option<u64>,
+    eval_duration: Option<u64>,
+    total_duration: Option<u64>,
+}
+
+/// Token and timing statistics from an Ollama generation
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct InferenceStats {
+    prompt_tokens: u64,
+    output_tokens: u64,
+    eval_duration_ns: u64,
+    total_duration_ns: u64,
+}
+
+impl InferenceStats {
+    /// Extract stats from the fields Ollama includes on its final chunk
+    fn from_chunk(
+        prompt_eval_count: Option<u64>,
+        eval_count: Option<u64>,
+        eval_duration: Option<u64>,
+        total_duration: Option<u64>,
+    ) -> Option<Self> {
+        Some(InferenceStats {
+            prompt_tokens: prompt_eval_count?,
+            output_tokens: eval_count.unwrap_or(0),
+            eval_duration_ns: eval_duration.unwrap_or(0),
+            total_duration_ns: total_duration.unwrap_or(0),
+        })
+    }
+}
+
+/// Format a stats line. The context limit is an estimate (~) because the
+/// effective window depends on Ollama's runtime num_ctx setting.
+fn format_stats(stats: &InferenceStats, context_limit: Option<u64>) -> String {
+    let eval_secs = stats.eval_duration_ns as f64 / 1e9;
+    let tokens_per_sec = if eval_secs > 0.0 {
+        stats.output_tokens as f64 / eval_secs
+    } else {
+        0.0
+    };
+    let total_secs = stats.total_duration_ns as f64 / 1e9;
+    let used = stats.prompt_tokens + stats.output_tokens;
+
+    let context_part = match context_limit {
+        Some(limit) if limit > 0 => {
+            let percent = used * 100 / limit;
+            format!(
+                " · context ~{}/{} ({}%), ~{} left",
+                used,
+                limit,
+                percent,
+                limit.saturating_sub(used)
+            )
+        }
+        _ => format!(" · context {} tokens used", used),
+    };
+
+    format!(
+        "[stats] {} tokens in {:.1}s ({:.1} tok/s) · prompt {} tokens · total {:.1}s{}",
+        stats.output_tokens,
+        eval_secs,
+        tokens_per_sec,
+        stats.prompt_tokens,
+        total_secs,
+        context_part
+    )
+}
+
+/// Ollama's runtime default context window when num_ctx isn't configured
+const OLLAMA_DEFAULT_NUM_CTX: u64 = 4096;
+
+/// Effective context limit from an /api/show response: an explicit num_ctx
+/// parameter wins; otherwise the model's max, capped at Ollama's default
+fn parse_context_limit(show: &serde_json::Value) -> Option<u64> {
+    if let Some(parameters) = show["parameters"].as_str() {
+        for line in parameters.lines() {
+            let mut tokens = line.split_whitespace();
+            if tokens.next() == Some("num_ctx") {
+                if let Some(value) = tokens.next().and_then(|v| v.parse().ok()) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    if let Some(info) = show["model_info"].as_object() {
+        for (key, value) in info {
+            if key.ends_with(".context_length") {
+                if let Some(max) = value.as_u64() {
+                    return Some(max.min(OLLAMA_DEFAULT_NUM_CTX));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Fetch the model's effective context limit from Ollama, best-effort
+fn model_context_limit(model: &str, endpoint: &str) -> Option<u64> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let url = format!("{}/api/show", endpoint.trim_end_matches('/'));
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({ "model": model, "name": model }))
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    parse_context_limit(&response.json().ok()?)
 }
 
 // Chat API structures
@@ -147,6 +265,21 @@ struct ChatRequest {
 #[derive(Deserialize)]
 struct ChatResponse {
     message: Message,
+    prompt_eval_count: Option<u64>,
+    eval_count: Option<u64>,
+    eval_duration: Option<u64>,
+    total_duration: Option<u64>,
+}
+
+impl ChatResponse {
+    fn stats(&self) -> Option<InferenceStats> {
+        InferenceStats::from_chunk(
+            self.prompt_eval_count,
+            self.eval_count,
+            self.eval_duration,
+            self.total_duration,
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1198,13 +1331,13 @@ fn list_models(endpoint: &str) -> Result<Vec<String>, Box<dyn std::error::Error>
 }
 
 /// Call the Ollama API, streaming each token to `out` as it arrives.
-/// Returns the full accumulated response.
+/// Returns the full accumulated response and generation stats.
 fn call_ollama(
     prompt: &str,
     model: &str,
     endpoint: &str,
     out: &mut dyn Write,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(String, Option<InferenceStats>), Box<dyn std::error::Error>> {
     let client = Client::new();
     let url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
 
@@ -1248,11 +1381,17 @@ fn call_ollama(
         }
 
         if chunk.done {
-            break;
+            let stats = InferenceStats::from_chunk(
+                chunk.prompt_eval_count,
+                chunk.eval_count,
+                chunk.eval_duration,
+                chunk.total_duration,
+            );
+            return Ok((full_response, stats));
         }
     }
 
-    Ok(full_response)
+    Ok((full_response, None))
 }
 
 /// Get the user prompt from either command-line argument or stdin
@@ -1397,16 +1536,20 @@ struct ChatStreamChunk {
     #[serde(default)]
     done: bool,
     error: Option<String>,
+    prompt_eval_count: Option<u64>,
+    eval_count: Option<u64>,
+    eval_duration: Option<u64>,
+    total_duration: Option<u64>,
 }
 
 /// Call Ollama's chat API without tools, streaming each token to `out`.
-/// Returns the full accumulated response.
+/// Returns the full accumulated response and generation stats.
 fn call_ollama_chat_streaming(
     messages: &[Message],
     model: &str,
     endpoint: &str,
     out: &mut dyn Write,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(String, Option<InferenceStats>), Box<dyn std::error::Error>> {
     let client = Client::new();
     let url = format!("{}/api/chat", endpoint.trim_end_matches('/'));
 
@@ -1453,11 +1596,17 @@ fn call_ollama_chat_streaming(
         }
 
         if chunk.done {
-            break;
+            let stats = InferenceStats::from_chunk(
+                chunk.prompt_eval_count,
+                chunk.eval_count,
+                chunk.eval_duration,
+                chunk.total_duration,
+            );
+            return Ok((full_response, stats));
         }
     }
 
-    Ok(full_response)
+    Ok((full_response, None))
 }
 
 fn call_ollama_chat(
@@ -1533,7 +1682,7 @@ fn run_tool_loop(
     max_results: usize,
     trace: &mut SearchTrace,
     collect_summaries: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(String, Option<InferenceStats>), Box<dyn std::error::Error>> {
     let tools = build_tool_definitions();
     const MAX_ITERATIONS: usize = 10;
 
@@ -1606,8 +1755,9 @@ fn run_tool_loop(
 
         // No tool calls: keep the final reply in context and return it
         let final_response = response.message.content.clone();
+        let stats = response.stats();
         messages.push(response.message);
-        return Ok(final_response);
+        return Ok((final_response, stats));
     }
 
     Err(format!(
@@ -1627,11 +1777,11 @@ fn chat_with_tools(
     verbose: bool,
     style: OutputStyle,
     context: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(String, Option<InferenceStats>), Box<dyn std::error::Error>> {
     let mut messages = build_initial_messages(user_request, style, context);
     let mut trace = SearchTrace::default();
 
-    let final_response = run_tool_loop(
+    let (final_response, stats) = run_tool_loop(
         &mut messages,
         model,
         endpoint,
@@ -1642,7 +1792,7 @@ fn chat_with_tools(
     )?;
 
     if !verbose {
-        return Ok(final_response);
+        return Ok((final_response, stats));
     }
 
     // Format verbose output
@@ -1670,7 +1820,14 @@ fn chat_with_tools(
     output.push_str("[Command]\n");
     output.push_str(&final_response);
 
-    Ok(output)
+    Ok((output, stats))
+}
+
+/// Print a stats line to stderr when stats are available
+fn print_stats_line(stats: Option<InferenceStats>, context_limit: Option<u64>) {
+    if let Some(stats) = stats {
+        eprintln!("{}", format_stats(&stats, context_limit));
+    }
 }
 
 /// Environment context for the prompt, unless disabled with --no-context
@@ -1696,6 +1853,9 @@ fn run_repl(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     eprintln!("term-ai interactive mode — describe what you need, or 'help' for commands.");
+
+    let context_limit = model_context_limit(&args.model, &args.endpoint);
+    let mut last_stats: Option<InferenceStats> = None;
 
     let context = environment_context(args);
     let mut messages = vec![system_message(
@@ -1745,9 +1905,16 @@ fn run_repl(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 continue;
             }
+            "stats" => {
+                match last_stats {
+                    Some(stats) => eprintln!("{}", format_stats(&stats, context_limit)),
+                    None => eprintln!("No completed turns yet."),
+                }
+                continue;
+            }
             "help" => {
                 eprintln!(
-                    "Commands: exit/quit — leave · clear — reset conversation context · history — recent commands · help — this message.\nAnything else is sent to the model."
+                    "Commands: exit/quit — leave · clear — reset conversation context · history — recent commands · stats — last-turn stats and context usage · help — this message.\nAnything else is sent to the model."
                 );
                 continue;
             }
@@ -1772,20 +1939,24 @@ fn run_repl(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 &mut trace,
                 false,
             )
-            .map(|text| {
+            .map(|(text, stats)| {
                 println!("{}", text);
-                text
+                (text, stats)
             })
         } else {
             call_ollama_chat_streaming(&messages, &args.model, &args.endpoint, &mut io::stdout())
-                .map(|text| {
+                .map(|(text, stats)| {
                     println!();
-                    text
+                    (text, stats)
                 })
         };
 
         match response {
-            Ok(text) => {
+            Ok((text, stats)) => {
+                last_stats = stats;
+                if args.stats {
+                    print_stats_line(stats, context_limit);
+                }
                 if provider.is_none() {
                     // run_tool_loop keeps context itself; the streaming path
                     // pushes the assistant reply here
@@ -1920,8 +2091,11 @@ fn main() {
             context.as_deref(),
         );
         match call_ollama(&prompt, &args.model, &args.endpoint, &mut io::stdout()) {
-            Ok(text) => {
+            Ok((text, stats)) => {
                 println!();
+                if args.stats {
+                    print_stats_line(stats, model_context_limit(&args.model, &args.endpoint));
+                }
                 print_safety_warnings(&text);
                 let outcome = handle_execution(&text, &args);
                 record_history(
@@ -1972,9 +2146,9 @@ fn main() {
             OutputStyle::from_args(&args),
             environment_context(&args).as_deref(),
         )
-        .map(|text| {
+        .map(|(text, stats)| {
             println!("{}", text);
-            text
+            (text, stats)
         })
     } else {
         // Default mode - streams tokens to stdout as they arrive
@@ -1989,14 +2163,17 @@ fn main() {
             &args.endpoint,
             &mut io::stdout(),
         )
-        .map(|text| {
+        .map(|(text, stats)| {
             println!();
-            text
+            (text, stats)
         })
     };
 
     match result {
-        Ok(text) => {
+        Ok((text, stats)) => {
+            if args.stats {
+                print_stats_line(stats, model_context_limit(&args.model, &args.endpoint));
+            }
             print_safety_warnings(&text);
             let (outcome, history_command) = if args.alternatives {
                 handle_alternatives_execution(&text, &args)
@@ -2704,6 +2881,78 @@ mod tests {
     }
 
     #[test]
+    fn test_inference_stats_from_final_chunk() {
+        let chunk: StreamChunk = serde_json::from_str(
+            r#"{"response":"","done":true,"prompt_eval_count":212,"eval_count":8,"eval_duration":400000000,"total_duration":900000000}"#,
+        )
+        .unwrap();
+        let stats = InferenceStats::from_chunk(
+            chunk.prompt_eval_count,
+            chunk.eval_count,
+            chunk.eval_duration,
+            chunk.total_duration,
+        )
+        .unwrap();
+        assert_eq!(stats.prompt_tokens, 212);
+        assert_eq!(stats.output_tokens, 8);
+
+        // No prompt_eval_count -> no stats
+        assert!(InferenceStats::from_chunk(None, Some(5), None, None).is_none());
+    }
+
+    #[test]
+    fn test_format_stats() {
+        let stats = InferenceStats {
+            prompt_tokens: 212,
+            output_tokens: 8,
+            eval_duration_ns: 400_000_000,
+            total_duration_ns: 900_000_000,
+        };
+
+        let line = format_stats(&stats, Some(4096));
+        assert_eq!(
+            line,
+            "[stats] 8 tokens in 0.4s (20.0 tok/s) \u{b7} prompt 212 tokens \u{b7} total 0.9s \u{b7} context ~220/4096 (5%), ~3876 left"
+        );
+
+        // Without a known limit, still shows usage
+        let line = format_stats(&stats, None);
+        assert!(line.contains("context 220 tokens used"));
+
+        // Zero eval duration doesn't divide by zero
+        let zero = InferenceStats {
+            prompt_tokens: 1,
+            output_tokens: 0,
+            eval_duration_ns: 0,
+            total_duration_ns: 0,
+        };
+        assert!(format_stats(&zero, None).contains("(0.0 tok/s)"));
+    }
+
+    #[test]
+    fn test_parse_context_limit() {
+        // Explicit num_ctx parameter wins
+        let with_num_ctx = serde_json::json!({
+            "parameters": "num_ctx 8192\nstop \"<|eot|>\"",
+            "model_info": {"llama.context_length": 131072}
+        });
+        assert_eq!(parse_context_limit(&with_num_ctx), Some(8192));
+
+        // Otherwise model max capped at Ollama's runtime default
+        let big_model = serde_json::json!({
+            "model_info": {"llama.context_length": 131072}
+        });
+        assert_eq!(parse_context_limit(&big_model), Some(4096));
+
+        let small_model = serde_json::json!({
+            "model_info": {"gemma.context_length": 2048}
+        });
+        assert_eq!(parse_context_limit(&small_model), Some(2048));
+
+        assert_eq!(parse_context_limit(&serde_json::json!({})), None);
+    }
+
+    #[test]
     fn test_stream_chunk_parsing() {
         let chunk: StreamChunk =
             serde_json::from_str(r#"{"model":"llama3.2","response":"brew ","done":false}"#)
@@ -2771,6 +3020,7 @@ mod tests {
             interactive: false,
             no_context: false,
             alternatives: false,
+            stats: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2802,6 +3052,7 @@ mod tests {
             interactive: false,
             no_context: false,
             alternatives: false,
+            stats: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2835,6 +3086,7 @@ mod tests {
             interactive: false,
             no_context: false,
             alternatives: false,
+            stats: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2866,6 +3118,7 @@ mod tests {
             interactive: false,
             no_context: false,
             alternatives: false,
+            stats: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2899,6 +3152,7 @@ mod tests {
             interactive: false,
             no_context: false,
             alternatives: false,
+            stats: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2930,6 +3184,7 @@ mod tests {
             interactive: false,
             no_context: false,
             alternatives: false,
+            stats: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2963,6 +3218,7 @@ mod tests {
             interactive: false,
             no_context: false,
             alternatives: false,
+            stats: false,
         };
 
         let provider = create_search_provider(&args);
@@ -2994,6 +3250,7 @@ mod tests {
             interactive: false,
             no_context: false,
             alternatives: false,
+            stats: false,
         };
 
         let provider = create_search_provider(&args);

@@ -92,6 +92,23 @@ term-ai "latest homebrew formulas" -w --model llama3.1
 term-ai "latest homebrew formulas" -w --search-provider serpapi --model llama3.1
 ```
 
+### Inference Stats
+
+See what the model actually did — token counts, generation speed, and how
+much of the context window remains:
+
+```bash
+$ term-ai "install jq" --stats
+brew install jq
+[stats] 4 tokens in 0.1s (32.4 tok/s) · prompt 216 tokens · total 4.3s · context ~220/4096 (5%), ~3876 left
+```
+
+This matters most in the REPL, where the conversation quietly grows toward
+the context limit — `--stats` prints a line after each turn, and the
+`stats` command shows the latest numbers anytime. The limit is an estimate
+(from `num_ctx` or the model card via `/api/show`); stats go to stderr so
+stdout stays pipeable.
+
 ### Context Awareness
 
 term-ai automatically includes environment context in its prompts — OS,
@@ -353,6 +370,10 @@ Options:
   --no-context
           Disable automatic environment context (project type, git status,
           directory listing) in the prompt
+
+  -s, --stats
+          Show inference stats (tokens, speed, context usage) after each
+          response
 
   -h, --help
           Print help
