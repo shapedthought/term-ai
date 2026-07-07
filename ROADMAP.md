@@ -612,6 +612,61 @@ No personal data is collected.
 
 ---
 
+### Phase 6: Vendor Knowledge Packs (Plugin System)
+**Timeline**: ~1 week
+**Goal**: Accurate commands for vendor-specific tooling (Veeam, kubectl, terraform, ...) that local models hallucinate
+
+#### 6.1 Knowledge Packs ⭐⭐⭐⭐
+**Priority**: MEDIUM
+**Complexity**: Medium
+**Effort**: 2-3 days + pack content
+
+**Feature:**
+Declarative TOML packs in `~/.term-ai/plugins/` that inject authoritative
+reference material into the prompt when triggered:
+
+```toml
+# ~/.term-ai/plugins/veeam.toml
+name = "veeam"
+description = "Veeam Backup & Replication — PowerShell, veeamconfig, REST API"
+triggers = ["veeam", "vbr", "backup job", "restore point"]
+
+context = """
+Veeam command reference (authoritative — prefer these over guessing):
+- VBR PowerShell (Windows console): Get-VBRJob, Start-VBRJob -Job $job, ...
+- Linux agent: veeamconfig job list, ...
+- REST API (macOS-friendly): GET /api/v1/jobs, ...
+"""
+
+[[section]]
+name = "rest-api"
+triggers = ["rest", "api", "curl"]
+context = "..."
+
+[[danger_patterns]]
+pattern = "Remove-VBRBackup"
+reason = "permanently deletes backup data"
+```
+
+**Design decisions (settled July 2026):**
+- Keyword triggers + whole-pack injection. Packs are cheat-sheet sized
+  (2-5k tokens) and fit in context; no retrieval infrastructure needed.
+- Optional per-section triggers give progressive disclosure with plain
+  keyword matching — the pack summary injects on the pack trigger,
+  sections only when their own keywords also match.
+- `danger_patterns` extend the safety linter per pack (critical for
+  backup tooling: e.g. flag `Remove-VBRBackup`).
+- First-party `veeam.toml` reference pack ships as the showcase.
+
+**Explicitly deferred (build only if usage proves the need):**
+- Embedding retrieval (Ollama `/api/embed` + flat-file vectors, brute-force
+  cosine — NOT ChromaDB or any external DB). Only pays off for packs too
+  large to inject whole.
+- A `read_reference` tool for model-driven disclosure — small local models
+  are unreliable tool callers; bounded local content doesn't need it.
+
+---
+
 ## Feature Comparison Matrix
 
 | Feature | Impact | Complexity | LOC | Effort | Priority | Phase |
